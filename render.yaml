@@ -1,0 +1,18 @@
+# Render Web Service (free tier available).
+# Background Workers are not free — use type: web + /health on $PORT.
+services:
+  - type: web
+    name: surprise-attack-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python surprise_attack_bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      # Set these in the Render dashboard (secrets), not in git:
+      # DISCORD_TOKEN
+      # SA_CHANNEL_ID
+      # GEMINI_API_KEY (optional, for screenshots)
+      # SA_OPERATOR_ROLE_IDS (optional)
