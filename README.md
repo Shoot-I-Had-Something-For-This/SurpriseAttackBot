@@ -53,8 +53,13 @@ python surprise_attack_bot.py
 | Command | Who | What |
 |---------|-----|------|
 | `!sa start [Song - Artist]` | Operator | Open event + post board |
+| `!sa start … for 1h` | Operator | Start now, auto take-down |
+| `!sa start … in 30m` | Operator | Schedule put-up |
+| `!sa start … in 30m for 1h` | Operator | Delayed start + duration |
 | `!sa end` | Operator | Close, summarize, archive |
-| `!sa status` | Anyone | Is something live? |
+| `!sa end in 45m` | Operator | Schedule take-down |
+| `!sa cancel` | Operator | Cancel pending put-up / take-down timer |
+| `!sa status` | Anyone | Live / scheduled + timers |
 | `!sa board` | Operator | Refresh board message |
 | `!sa help` | Anyone | Help text |
 

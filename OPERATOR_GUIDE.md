@@ -52,12 +52,19 @@ Examples:
 !sa start Danger - Shotty Horroh
 !sa start Enter Sandman
 !sa start
+!sa start Danger - Shotty Horroh for 1h
+!sa start Danger - Shotty Horroh in 30m
+!sa start Danger - Shotty Horroh in 30m for 1h
 ```
 
 - With a song name: only matching scores count (best-effort title match).
 - Without a song: any song is accepted (useful for testing).
+- **`for 1h`** — auto **take-down** after that long (event still starts now unless you also use `in`).
+- **`in 30m`** — schedule **put-up** later (bot posts a yellow “scheduled” notice).
+- **`in 30m for 1h`** — put-up later, then auto take-down after 1 hour of play.
+- Durations: `30m`, `1h`, `2h30m`, or bare minutes (`90` = 90 minutes).
 
-The bot posts:
+The bot posts (when it goes live):
 
 1. A “LIVE” announcement in the main channel  
 2. A **scores thread** (players post embeds/screenshots **only there**)  
@@ -69,17 +76,28 @@ If someone posts a score in the main channel, the bot points them at the thread.
 
 ```
 !sa end
+!sa end in 45m
 ```
 
-- Freezes the board  
-- Posts top 3 per mode  
-- Saves a result file on the bot host (`history/sa-….json`)
+- `!sa end` — take down **now** (freeze board, top 3 per mode, archive file)
+- `!sa end in 45m` — schedule take-down while the event stays live
+
+### Cancel timers
+
+```
+!sa cancel
+```
+
+- If a **put-up** is waiting: scraps it (nothing goes live).  
+- If live with a **take-down** timer: clears the timer; event stays live until `!sa end`.
 
 ### Check status
 
 ```
 !sa status
 ```
+
+Shows live / scheduled state and any put-up or take-down times.
 
 ### Refresh the board
 

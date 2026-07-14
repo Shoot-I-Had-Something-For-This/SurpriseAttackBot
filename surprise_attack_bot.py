@@ -8,11 +8,14 @@ One live channel per event:
   - One live leaderboard message with three mode sections
 
 Operator commands (role or Manage Server):
-  !sa start [Song - Artist]
-  !sa end
-  !sa status
-  !sa board
-  !sa help
+  !sa start [Song - Artist]              start now
+  !sa start [Song - Artist] for 1h       start now, auto-end later
+  !sa start [Song - Artist] in 30m       schedule put-up
+  !sa start [Song - Artist] in 30m for 1h
+  !sa end                                take down now
+  !sa end in 45m                         schedule take-down
+  !sa cancel                             cancel pending start/end timers
+  !sa status / board / help
 """
 
 from __future__ import annotations
@@ -119,6 +122,10 @@ def empty_state() -> dict:
         "announce_message_id": None,
         # Public thread under #sa where players post scores (keeps main channel clean)
         "submit_thread_id": None,
+        # Timers (unix seconds). scheduled_duration_sec = auto-end length after start.
+        "scheduled_start_at": None,
+        "scheduled_end_at": None,
+        "scheduled_duration_sec": None,
         "scores": {m: {} for m in MODES},
         "history": [],  # recent closed event summaries (ids only; full dumps in history/)
     }
@@ -215,6 +222,108 @@ def parse_title_artist(text: str) -> tuple[str | None, str | None]:
             if left.strip() and right.strip():
                 return left.strip(), right.strip()
     return raw, None
+
+
+def parse_duration_token(token: str) -> int | None:
+    """
+    Parse a duration into seconds.
+    Accepts: 30m, 1h, 2h30m, 90 (minutes), 45s, 1.5h, 1d
+    """
+    raw = (token or "").strip().lower()
+    if not raw:
+        return None
+    if re.fullmatch(r"\d+", raw):
+        return int(raw) * 60  # bare number = minutes
+    parts = re.findall(r"(\d+(?:\.\d+)?)\s*([smhd])", raw)
+    if not parts or "".join(n + u for n, u in parts) != re.sub(r"\s+", "", raw):
+        # allow glued forms like 2h30m (findall already gets them)
+        if not parts:
+            return None
+        rebuilt = "".join(n + u for n, u in parts)
+        if rebuilt != re.sub(r"\s+", "", raw):
+            return None
+    total = 0.0
+    for num_s, unit in parts:
+        val = float(num_s)
+        if unit == "s":
+            total += val
+        elif unit == "m":
+            total += val * 60
+        elif unit == "h":
+            total += val * 3600
+        elif unit == "d":
+            total += val * 86400
+    sec = int(total)
+    return sec if sec > 0 else None
+
+
+def format_duration(seconds: int | None) -> str:
+    if not seconds or seconds <= 0:
+        return "—"
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if mins:
+        parts.append(f"{mins}m")
+    if secs and not parts:
+        parts.append(f"{secs}s")
+    elif secs and days == 0 and hours == 0:
+        parts.append(f"{secs}s")
+    return " ".join(parts) if parts else "0s"
+
+
+def extract_schedule_args(rest: str) -> dict:
+    """
+    Strip trailing `in <dur>` / `for <dur>` (any order, up to one each).
+    Returns song_rest, start_in_sec, duration_sec.
+    """
+    text = (rest or "").strip()
+    start_in_sec: int | None = None
+    duration_sec: int | None = None
+    pat_in = re.compile(r"\bin\s+(\S+)\s*$", re.I)
+    pat_for = re.compile(r"\bfor\s+(\S+)\s*$", re.I)
+
+    for _ in range(2):
+        m_in = pat_in.search(text)
+        m_for = pat_for.search(text)
+        picks: list[tuple[str, re.Match[str]]] = []
+        if m_in:
+            picks.append(("in", m_in))
+        if m_for:
+            picks.append(("for", m_for))
+        if not picks:
+            break
+        kind, match = max(picks, key=lambda item: item[1].start())
+        sec = parse_duration_token(match.group(1))
+        if sec is None:
+            break
+        if kind == "in":
+            start_in_sec = sec
+        else:
+            duration_sec = sec
+        text = text[: match.start()].strip()
+
+    return {
+        "song_rest": text,
+        "start_in_sec": start_in_sec,
+        "duration_sec": duration_sec,
+    }
+
+
+def clear_schedule_fields(state: dict) -> None:
+    state["scheduled_start_at"] = None
+    state["scheduled_end_at"] = None
+    state["scheduled_duration_sec"] = None
+
+
+def has_pending_schedule(state: dict) -> bool:
+    return bool(state.get("scheduled_start_at") or state.get("scheduled_end_at"))
 
 
 def titles_match(a: str | None, b: str | None) -> bool:
@@ -613,17 +722,43 @@ def song_line(state: dict) -> str:
     return "_Any song (no filter)_"
 
 
+def timer_lines(state: dict) -> list[str]:
+    """Human-readable schedule lines for status / board."""
+    lines: list[str] = []
+    start_at = state.get("scheduled_start_at")
+    end_at = state.get("scheduled_end_at")
+    if start_at and not state.get("active"):
+        lines.append(f"**Put up:** <t:{int(start_at)}:F> · <t:{int(start_at)}:R>")
+    if end_at and (state.get("active") or start_at):
+        lines.append(f"**Take down:** <t:{int(end_at)}:F> · <t:{int(end_at)}:R>")
+    dur = state.get("scheduled_duration_sec")
+    if dur and not end_at and not state.get("active") and start_at:
+        lines.append(f"**Duration after start:** {format_duration(int(dur))}")
+    return lines
+
+
 def build_board_embeds(state: dict) -> list[discord.Embed]:
-    status = "LIVE" if state.get("active") else "CLOSED"
-    color = 0x22C55E if state.get("active") else 0x64748B
+    if state.get("active"):
+        status = "LIVE"
+        color = 0x22C55E
+    elif state.get("scheduled_start_at"):
+        status = "SCHEDULED"
+        color = 0xEAB308
+    else:
+        status = "CLOSED"
+        color = 0x64748B
+
+    desc_parts = [
+        f"**Status:** {status}",
+        f"**Song:** {song_line(state)}",
+        f"**Event:** `{state.get('event_id') or '—'}`",
+    ]
+    desc_parts.extend(timer_lines(state))
+    desc_parts.append(f"_Updated <t:{int(time.time())}:R>_")
+
     header = discord.Embed(
         title=f"{BOARD_MARKER}",
-        description=(
-            f"**Status:** {status}\n"
-            f"**Song:** {song_line(state)}\n"
-            f"**Event:** `{state.get('event_id') or '—'}`\n"
-            f"_Updated <t:{int(time.time())}:R>_"
-        ),
+        description="\n".join(desc_parts),
         color=color,
     )
     header.set_footer(text="One board · three modes · forward your score here")
@@ -647,6 +782,11 @@ def build_announce_embed(state: dict) -> discord.Embed:
     else:
         where = "the **scores thread** under this post"
 
+    end_note = ""
+    if state.get("scheduled_end_at"):
+        end_at = int(state["scheduled_end_at"])
+        end_note = f"\n\n⏱️ **Auto take-down:** <t:{end_at}:F> · <t:{end_at}:R>"
+
     emb = discord.Embed(
         title="⚡ Surprise Attack is LIVE",
         description=(
@@ -657,6 +797,7 @@ def build_announce_embed(state: dict) -> discord.Embed:
             f"3. Post it in {where}\n\n"
             "The bot sorts your score into Arcade / Classic / Fusion automatically.\n"
             "Leaderboard stays in this channel — only scores go in the thread."
+            f"{end_note}"
         ),
         color=0x22C55E,
     )
@@ -666,6 +807,30 @@ def build_announce_embed(state: dict) -> discord.Embed:
         inline=False,
     )
     emb.set_footer(text=f"Event {state.get('event_id')}")
+    return emb
+
+
+def build_scheduled_announce_embed(state: dict) -> discord.Embed:
+    start_at = int(state.get("scheduled_start_at") or 0)
+    end_at = state.get("scheduled_end_at")
+    dur = state.get("scheduled_duration_sec")
+    lines = [
+        f"Song: {song_line(state)}",
+        "",
+        f"⏱️ **Goes live:** <t:{start_at}:F> · <t:{start_at}:R>",
+    ]
+    if end_at:
+        lines.append(f"⏱️ **Take down:** <t:{int(end_at)}:F> · <t:{int(end_at)}:R>")
+    elif dur:
+        lines.append(f"⏱️ **Runs for:** {format_duration(int(dur))} after start")
+    lines.append("")
+    lines.append("Scores open when the event goes live. Operators: `!sa cancel` to scrap the timer.")
+    emb = discord.Embed(
+        title="📅 Surprise Attack scheduled",
+        description="\n".join(lines),
+        color=0xEAB308,
+    )
+    emb.set_footer(text="Put-up timer set")
     return emb
 
 
@@ -895,6 +1060,197 @@ def archive_event(state: dict) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Start / end (manual + scheduled)
+# ---------------------------------------------------------------------------
+
+# Prevent double-fire if tick races (created lazily for the running loop)
+_schedule_lock: asyncio.Lock | None = None
+_scheduler_started = False
+
+
+def _get_schedule_lock() -> asyncio.Lock:
+    global _schedule_lock
+    if _schedule_lock is None:
+        _schedule_lock = asyncio.Lock()
+    return _schedule_lock
+
+
+async def begin_live_event(
+    *,
+    title: str | None,
+    artist: str | None,
+    duration_sec: int | None = None,
+    preserve_board: bool = False,
+) -> dict:
+    """
+    Open a live event: announce, scores thread, board.
+    duration_sec → auto take-down after that many seconds.
+    """
+    state = empty_state()
+    # Keep board message id if we're promoting a pre-announce in same channel
+    if preserve_board:
+        old = load_state()
+        state["board_message_id"] = old.get("board_message_id")
+        state["channel_id"] = old.get("channel_id")
+
+    now = int(time.time())
+    state["active"] = True
+    state["event_id"] = new_event_id()
+    state["song_title"] = title
+    state["song_artist"] = artist
+    state["started_at"] = now
+    state["channel_id"] = SA_CHANNEL_ID
+    state["scores"] = {m: {} for m in MODES}
+    state["scheduled_start_at"] = None
+    state["scheduled_duration_sec"] = None
+    if duration_sec and duration_sec > 0:
+        state["scheduled_end_at"] = now + int(duration_sec)
+    else:
+        state["scheduled_end_at"] = None
+    save_state(state)
+
+    channel = await get_sa_channel()
+    ann = None
+    thread = None
+    if channel:
+        try:
+            ann = await channel.send(embed=build_announce_embed(state))
+            state["announce_message_id"] = ann.id
+            save_state(state)
+        except discord.HTTPException as e:
+            print(f"Announce post failed: {e}")
+
+        thread = await ensure_submit_thread(channel, ann, state)
+        if thread and ann:
+            try:
+                await ann.edit(embed=build_announce_embed(state))
+            except discord.HTTPException:
+                pass
+
+        await update_board(state, force_new=not preserve_board)
+
+    state = load_state()
+    state["_thread_id"] = thread.id if thread else None
+    return state
+
+
+async def finish_live_event(*, auto: bool = False) -> dict:
+    """Close the live event, archive, freeze board, lock scores thread."""
+    state = load_state()
+    if not state.get("active"):
+        return state
+
+    state["active"] = False
+    state["ended_at"] = int(time.time())
+    state["scheduled_end_at"] = None
+    state["scheduled_duration_sec"] = None
+    state["scheduled_start_at"] = None
+    path = archive_event(state)
+    save_state(state)
+    await update_board(state)
+    await close_submit_thread(state)
+
+    lines = [
+        f"**Surprise Attack ended** `{state.get('event_id')}`"
+        + (" _(timer)_" if auto else ""),
+        f"Song: {song_line(state)}",
+    ]
+    for mode in MODES:
+        rows = ranked_mode_scores(state, mode, limit=3)
+        if rows:
+            top = ", ".join(f"{r['player_name']} `{int(r['score']):,}`" for r in rows)
+            lines.append(f"{MODE_LABELS[mode]}: {top}")
+        else:
+            lines.append(f"{MODE_LABELS[mode]}: _no scores_")
+    if path:
+        lines.append(f"_Archived to `{path.name}`_")
+
+    # Auto take-down has no operator message to reply to — post standings in channel.
+    # Manual `!sa end` replies in the command handler instead (avoid double post).
+    if auto:
+        channel = await get_sa_channel()
+        if channel:
+            try:
+                await channel.send("\n".join(lines))
+            except discord.HTTPException as e:
+                print(f"End announce failed: {e}")
+
+    state["_summary_lines"] = lines
+    state["_archive_path"] = str(path) if path else None
+    return state
+
+
+async def post_scheduled_notice(state: dict) -> None:
+    channel = await get_sa_channel()
+    if not channel:
+        return
+    try:
+        msg = await channel.send(embed=build_scheduled_announce_embed(state))
+        state["announce_message_id"] = msg.id
+        save_state(state)
+        await update_board(state, force_new=True)
+    except discord.HTTPException as e:
+        print(f"Scheduled announce failed: {e}")
+
+
+async def scheduler_tick() -> None:
+    """Fire due put-up / take-down timers."""
+    async with _get_schedule_lock():
+        state = load_state()
+        now = int(time.time())
+
+        # Put-up
+        start_at = state.get("scheduled_start_at")
+        if start_at and not state.get("active") and now >= int(start_at):
+            title = state.get("song_title")
+            artist = state.get("song_artist")
+            duration = state.get("scheduled_duration_sec")
+            # If end was pre-computed as absolute from schedule time, convert to remaining duration
+            end_at = state.get("scheduled_end_at")
+            if end_at and not duration:
+                remaining = int(end_at) - now
+                duration = remaining if remaining > 0 else None
+            print(f"Scheduler: putting up event song={title!r}")
+            await begin_live_event(
+                title=title,
+                artist=artist,
+                duration_sec=int(duration) if duration else None,
+                preserve_board=True,
+            )
+            channel = await get_sa_channel()
+            if channel:
+                try:
+                    st = load_state()
+                    note = f"⚡ **Surprise Attack is LIVE** (timer) · {song_line(st)}"
+                    if st.get("scheduled_end_at"):
+                        note += f"\nTake-down: <t:{int(st['scheduled_end_at'])}:R>"
+                    if st.get("submit_thread_id"):
+                        note += f"\nScores: <#{st['submit_thread_id']}>"
+                    await channel.send(note)
+                except discord.HTTPException:
+                    pass
+            return
+
+        # Take-down
+        state = load_state()
+        end_at = state.get("scheduled_end_at")
+        if state.get("active") and end_at and now >= int(end_at):
+            print(f"Scheduler: taking down event {state.get('event_id')}")
+            await finish_live_event(auto=True)
+
+
+async def scheduler_loop() -> None:
+    await client.wait_until_ready()
+    print("Schedule timer loop running (check every 15s)")
+    while not client.is_closed():
+        try:
+            await scheduler_tick()
+        except Exception as e:
+            print(f"Scheduler tick error: {e}")
+        await asyncio.sleep(15)
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -917,20 +1273,25 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         await message.reply(
             "**Surprise Attack bot**\n"
             "```\n"
-            "!sa start [Song - Artist]   open a new event\n"
-            "!sa end                     close event + freeze board\n"
-            "!sa status                  what's live + which channel\n"
-            "!sa where                   server/channel this bot is bound to\n"
-            "!sa board                   refresh the leaderboard post\n"
-            "!sa fake <mode> <score> [name]   test leaderboard (operator)\n"
-            "!sa clear [bot|all] [limit] clear channel messages (operator)\n"
-            "!sa help                    this message\n"
+            "!sa start [Song - Artist]              start now\n"
+            "!sa start [Song - Artist] for 1h       start now, auto take-down\n"
+            "!sa start [Song - Artist] in 30m       schedule put-up\n"
+            "!sa start [Song - Artist] in 30m for 1h\n"
+            "!sa end                                take down now\n"
+            "!sa end in 45m                         schedule take-down\n"
+            "!sa cancel                             cancel pending timers\n"
+            "!sa status                             live + timers + channel\n"
+            "!sa where                              bound channel check\n"
+            "!sa board                              refresh leaderboard\n"
+            "!sa fake <mode> <score> [name]         test board (operator)\n"
+            "!sa clear [bot|all] [limit]            clear messages\n"
+            "!sa help                               this message\n"
             "```\n"
-            "On `!sa start` the bot opens a **scores thread** — players post embeds/screenshots there.\n"
-            "Leaderboard stays in the main channel (Arcade / Classic / Fusion).\n"
-            "Use `!sa fake` on a test server to fill the board without the game.\n\n"
+            "Durations: `30m`, `1h`, `2h30m`, or bare minutes (`90` = 90m).\n"
+            "On start the bot opens a **scores thread** — players post there.\n"
+            "Leaderboard stays in the main channel (Arcade / Classic / Fusion).\n\n"
             "Bot needs **Create Public Threads** (+ Manage Threads to lock on end).\n"
-            "_Channel IDs are per-server — test and live always use different `.env` values._",
+            "_Channel IDs are per-server — test and live always use different env values._",
             mention_author=False,
         )
         return
@@ -964,21 +1325,26 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             f"**Server:** {guild_name}",
             f"**Watching channel ID:** `{SA_CHANNEL_ID}`",
         ]
-        if not state.get("active"):
-            lines.append("No Surprise Attack is live right now.")
-            lines.append("Operators: `!sa start Song - Artist`")
-            await message.reply("\n".join(lines), mention_author=False)
-            return
-        lines.extend(
-            [
-                f"**LIVE** `{state.get('event_id')}`",
-                f"Song: {song_line(state)}",
-            ]
-        )
-        if state.get("submit_thread_id"):
-            lines.append(f"**Scores thread:** <#{state['submit_thread_id']}>")
-        if state.get("started_at"):
-            lines.append(f"Started: <t:{int(state['started_at'])}:R>")
+        if state.get("active"):
+            lines.extend(
+                [
+                    f"**LIVE** `{state.get('event_id')}`",
+                    f"Song: {song_line(state)}",
+                ]
+            )
+            if state.get("submit_thread_id"):
+                lines.append(f"**Scores thread:** <#{state['submit_thread_id']}>")
+            if state.get("started_at"):
+                lines.append(f"Started: <t:{int(state['started_at'])}:R>")
+            lines.extend(timer_lines(state))
+        elif state.get("scheduled_start_at"):
+            lines.append("**SCHEDULED** (not live yet)")
+            lines.append(f"Song: {song_line(state)}")
+            lines.extend(timer_lines(state))
+            lines.append("Operators: `!sa cancel` to scrap · `!sa start …` to go live now")
+        else:
+            lines.append("No Surprise Attack is live or scheduled.")
+            lines.append("Operators: `!sa start Song - Artist` or `!sa start Song in 30m for 1h`")
         await message.reply("\n".join(lines), mention_author=False)
         return
 
@@ -994,85 +1360,170 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         if state.get("active"):
             await message.reply(
                 f"An event is already live: `{state.get('event_id')}`.\n"
-                "Run `!sa end` first.",
+                "Run `!sa end` first (or `!sa end in 30m` to schedule take-down).",
                 mention_author=False,
             )
             return
 
-        title, artist = parse_title_artist(rest) if rest else (None, None)
-        state = empty_state()
-        state["active"] = True
-        state["event_id"] = new_event_id()
-        state["song_title"] = title
-        state["song_artist"] = artist
-        state["started_at"] = int(time.time())
-        state["channel_id"] = SA_CHANNEL_ID
-        state["scores"] = {m: {} for m in MODES}
-        save_state(state)
+        sched = extract_schedule_args(rest)
+        start_in = sched["start_in_sec"]
+        duration = sched["duration_sec"]
+        song_rest = sched["song_rest"]
+        title, artist = parse_title_artist(song_rest) if song_rest else (None, None)
 
-        channel = await get_sa_channel()
-        ann = None
-        thread = None
-        if channel:
-            try:
-                # Placeholder announce first so we can attach a thread, then edit with link
-                ann = await channel.send(embed=build_announce_embed(state))
-                state["announce_message_id"] = ann.id
-                save_state(state)
-            except discord.HTTPException as e:
-                print(f"Announce post failed: {e}")
+        # Delayed put-up
+        if start_in:
+            if state.get("scheduled_start_at") and not state.get("active"):
+                await message.reply(
+                    "A put-up is already scheduled. "
+                    "`!sa cancel` first, or wait for it to fire.",
+                    mention_author=False,
+                )
+                return
 
-            thread = await ensure_submit_thread(channel, ann, state)
-            if thread and ann:
-                try:
-                    await ann.edit(embed=build_announce_embed(state))
-                except discord.HTTPException:
-                    pass
+            now = int(time.time())
+            state = empty_state()
+            state["active"] = False
+            state["song_title"] = title
+            state["song_artist"] = artist
+            state["channel_id"] = SA_CHANNEL_ID
+            state["scheduled_start_at"] = now + int(start_in)
+            if duration:
+                state["scheduled_duration_sec"] = int(duration)
+                state["scheduled_end_at"] = state["scheduled_start_at"] + int(duration)
+            else:
+                state["scheduled_duration_sec"] = None
+                state["scheduled_end_at"] = None
+            save_state(state)
+            await post_scheduled_notice(state)
 
-            await update_board(state, force_new=True)
+            reply = (
+                f"📅 **Put-up scheduled** in {format_duration(start_in)}\n"
+                f"Song: {song_line(state)}\n"
+                f"Goes live: <t:{state['scheduled_start_at']}:F> · "
+                f"<t:{state['scheduled_start_at']}:R>"
+            )
+            if duration:
+                reply += (
+                    f"\nRuns for {format_duration(duration)} → "
+                    f"take-down <t:{state['scheduled_end_at']}:R>"
+                )
+            reply += "\n`!sa cancel` to scrap the timer."
+            await message.reply(reply, mention_author=False)
+            return
 
+        # Start now (optional auto take-down via `for`)
+        state = await begin_live_event(
+            title=title,
+            artist=artist,
+            duration_sec=int(duration) if duration else None,
+        )
+        thread_id = state.get("submit_thread_id") or state.get("_thread_id")
         thread_note = (
-            f"Players post scores in <#{thread.id}>"
-            if thread
+            f"Players post scores in <#{thread_id}>"
+            if thread_id
             else "⚠️ Could not create scores thread — scores accepted in this channel "
             "(grant **Create Public Threads** and restart event)."
         )
-        await message.reply(
+        reply = (
             f"Surprise Attack **started** `{state['event_id']}`\n"
             f"Song: {song_line(state)}\n"
             f"{thread_note}\n"
-            "Leaderboard stays in this channel.",
-            mention_author=False,
+            "Leaderboard stays in this channel."
         )
+        if state.get("scheduled_end_at"):
+            reply += (
+                f"\n⏱️ Auto take-down: <t:{int(state['scheduled_end_at'])}:F> · "
+                f"<t:{int(state['scheduled_end_at'])}:R>"
+            )
+        await message.reply(reply, mention_author=False)
         return
 
     if action in ("end", "close", "stop"):
-        if not state.get("active"):
-            await message.reply("No active event to close.", mention_author=False)
+        sched = extract_schedule_args(rest)
+        end_in = sched["start_in_sec"]  # `in 45m` on end command
+        # Also allow bare `!sa end 45m` or `!sa end for 45m`
+        if end_in is None and sched["duration_sec"] is not None and not sched["song_rest"]:
+            end_in = sched["duration_sec"]
+        if end_in is None and rest.strip():
+            # bare duration: !sa end 30m
+            bare = parse_duration_token(rest.strip().split()[0]) if rest.strip() else None
+            if bare:
+                end_in = bare
+
+        if end_in:
+            if not state.get("active"):
+                await message.reply(
+                    "No live event to schedule take-down for.\n"
+                    "Start one first, or use `!sa start Song in 30m for 1h`.",
+                    mention_author=False,
+                )
+                return
+            now = int(time.time())
+            state["scheduled_end_at"] = now + int(end_in)
+            state["scheduled_duration_sec"] = None
+            save_state(state)
+            await update_board(state)
+            await message.reply(
+                f"⏱️ **Take-down scheduled** in {format_duration(end_in)}\n"
+                f"Ends: <t:{state['scheduled_end_at']}:F> · "
+                f"<t:{state['scheduled_end_at']}:R>\n"
+                f"`!sa end` now to close early · `!sa cancel` to clear this timer only "
+                f"(event stays live).",
+                mention_author=False,
+            )
             return
 
-        state["active"] = False
-        state["ended_at"] = int(time.time())
-        path = archive_event(state)
+        if not state.get("active"):
+            if state.get("scheduled_start_at"):
+                await message.reply(
+                    "Nothing live — a **put-up** is scheduled. "
+                    "Use `!sa cancel` to scrap it.",
+                    mention_author=False,
+                )
+            else:
+                await message.reply("No active event to close.", mention_author=False)
+            return
+
+        state = await finish_live_event(auto=False)
+        lines = state.get("_summary_lines") or [
+            f"**Surprise Attack ended** `{state.get('event_id')}`"
+        ]
+        await message.reply("\n".join(lines), mention_author=False)
+        return
+
+    if action in ("cancel", "unschedule", "abort"):
+        state = load_state()
+        had_start = bool(state.get("scheduled_start_at"))
+        had_end = bool(state.get("scheduled_end_at"))
+        if not had_start and not had_end:
+            await message.reply("No pending put-up or take-down timer.", mention_author=False)
+            return
+
+        # Cancel scheduled put-up that never went live → wipe pending event shell
+        if had_start and not state.get("active"):
+            clear_schedule_fields(state)
+            state["song_title"] = None
+            state["song_artist"] = None
+            state["event_id"] = None
+            save_state(state)
+            await update_board(state)
+            await message.reply(
+                "Cancelled scheduled **put-up**. No event is live.",
+                mention_author=False,
+            )
+            return
+
+        # Live event: only clear auto take-down
+        state["scheduled_end_at"] = None
+        state["scheduled_duration_sec"] = None
+        state["scheduled_start_at"] = None
         save_state(state)
         await update_board(state)
-        await close_submit_thread(state)
-
-        # Final standings summary
-        lines = [f"**Surprise Attack ended** `{state.get('event_id')}`", f"Song: {song_line(state)}"]
-        for mode in MODES:
-            rows = ranked_mode_scores(state, mode, limit=3)
-            if rows:
-                top = ", ".join(
-                    f"{r['player_name']} `{int(r['score']):,}`" for r in rows
-                )
-                lines.append(f"{MODE_LABELS[mode]}: {top}")
-            else:
-                lines.append(f"{MODE_LABELS[mode]}: _no scores_")
-        if path:
-            lines.append(f"_Archived to `{path.name}`_")
-
-        await message.reply("\n".join(lines), mention_author=False)
+        await message.reply(
+            "Cancelled **take-down timer**. Event stays **LIVE** until `!sa end`.",
+            mention_author=False,
+        )
         return
 
     if action in ("board", "lb", "refresh"):
@@ -1378,7 +1829,20 @@ async def on_ready():
     state = load_state()
     if state.get("active"):
         print(f"Resuming live event {state.get('event_id')}")
+        if state.get("scheduled_end_at"):
+            print(f"  take-down scheduled at unix {state['scheduled_end_at']}")
         asyncio.create_task(update_board(state))
+    elif state.get("scheduled_start_at"):
+        print(
+            f"Pending put-up at unix {state['scheduled_start_at']} "
+            f"song={state.get('song_title')!r}"
+        )
+
+    # Background put-up / take-down timers (survives redeploys via sa_state.json)
+    global _scheduler_started
+    if not _scheduler_started:
+        _scheduler_started = True
+        asyncio.create_task(scheduler_loop())
 
 
 @client.event
