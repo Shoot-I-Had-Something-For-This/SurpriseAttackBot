@@ -59,10 +59,11 @@ Examples:
 
 - With a song name: only matching scores count (best-effort title match).
 - Without a song: any song is accepted (useful for testing).
-- **`for 1h`** — auto **take-down** after that long (event still starts now unless you also use `in`).
-- **`in 30m`** — schedule **put-up** later (bot posts a yellow “scheduled” notice).
-- **`in 30m for 1h`** — put-up later, then auto take-down after 1 hour of play.
+- **`for 1h`** — auto **take-down** after that long (event still starts **now** unless you also use `in`).
+- **`in 30m`** — schedule **put-up** later. Bot posts a yellow **“not open”** notice only (no scores thread, no full board yet).
+- **`in 30m for 1h`** — put-up in 30m, then auto take-down after 1 hour of play.
 - Durations: `30m`, `1h`, `2h30m`, or bare minutes (`90` = 90 minutes).
+- People may emoji-react to the yellow schedule post — that does **not** mean the event is live. Live = green **LIVE** post + scores thread.
 
 The bot posts (when it goes live):
 

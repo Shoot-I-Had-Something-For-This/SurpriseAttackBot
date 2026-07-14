@@ -227,21 +227,38 @@ def parse_title_artist(text: str) -> tuple[str | None, str | None]:
 def parse_duration_token(token: str) -> int | None:
     """
     Parse a duration into seconds.
-    Accepts: 30m, 1h, 2h30m, 90 (minutes), 45s, 1.5h, 1d
+    Accepts: 30m, 30min, 30 minutes, 1h, 1hr, 2h30m, 90 (minutes), 45s, 1.5h, 1d
     """
     raw = (token or "").strip().lower()
     if not raw:
         return None
+    # Normalize words → single-letter units (order matters: longer first)
+    raw = re.sub(r"\bminutes?\b", "m", raw)
+    raw = re.sub(r"\bmins?\b", "m", raw)
+    raw = re.sub(r"\bhours?\b", "h", raw)
+    raw = re.sub(r"\bhrs?\b", "h", raw)
+    raw = re.sub(r"\bseconds?\b", "s", raw)
+    raw = re.sub(r"\bsecs?\b", "s", raw)
+    raw = re.sub(r"\bdays?\b", "d", raw)
+    # glued words: 30min, 2hrs, 1hour
+    raw = re.sub(r"(\d+(?:\.\d+)?)mins?\b", r"\1m", raw)
+    raw = re.sub(r"(\d+(?:\.\d+)?)minutes?\b", r"\1m", raw)
+    raw = re.sub(r"(\d+(?:\.\d+)?)hrs?\b", r"\1h", raw)
+    raw = re.sub(r"(\d+(?:\.\d+)?)hours?\b", r"\1h", raw)
+    raw = re.sub(r"(\d+(?:\.\d+)?)secs?\b", r"\1s", raw)
+    raw = re.sub(r"(\d+(?:\.\d+)?)seconds?\b", r"\1s", raw)
+    raw = re.sub(r"\s+", "", raw)
+
     if re.fullmatch(r"\d+", raw):
         return int(raw) * 60  # bare number = minutes
-    parts = re.findall(r"(\d+(?:\.\d+)?)\s*([smhd])", raw)
-    if not parts or "".join(n + u for n, u in parts) != re.sub(r"\s+", "", raw):
-        # allow glued forms like 2h30m (findall already gets them)
-        if not parts:
-            return None
-        rebuilt = "".join(n + u for n, u in parts)
-        if rebuilt != re.sub(r"\s+", "", raw):
-            return None
+
+    parts = re.findall(r"(\d+(?:\.\d+)?)([smhd])", raw)
+    if not parts:
+        return None
+    rebuilt = "".join(n + u for n, u in parts)
+    if rebuilt != raw:
+        return None
+
     total = 0.0
     for num_s, unit in parts:
         val = float(num_s)
@@ -281,13 +298,22 @@ def format_duration(seconds: int | None) -> str:
 def extract_schedule_args(rest: str) -> dict:
     """
     Strip trailing `in <dur>` / `for <dur>` (any order, up to one each).
-    Returns song_rest, start_in_sec, duration_sec.
+    Returns song_rest, start_in_sec, duration_sec, error (if `in`/`for` present but invalid).
     """
     text = (rest or "").strip()
     start_in_sec: int | None = None
     duration_sec: int | None = None
-    pat_in = re.compile(r"\bin\s+(\S+)\s*$", re.I)
-    pat_for = re.compile(r"\bfor\s+(\S+)\s*$", re.I)
+    error: str | None = None
+
+    # Allow multi-word durations: "in 30 minutes", "for 1 hour", "in 2h 30m"
+    pat_in = re.compile(
+        r"\bin\s+(\d+(?:\.\d+)?(?:\s*[a-z]+)?(?:\s+\d+(?:\.\d+)?(?:\s*[a-z]+)?)*)\s*$",
+        re.I,
+    )
+    pat_for = re.compile(
+        r"\bfor\s+(\d+(?:\.\d+)?(?:\s*[a-z]+)?(?:\s+\d+(?:\.\d+)?(?:\s*[a-z]+)?)*)\s*$",
+        re.I,
+    )
 
     for _ in range(2):
         m_in = pat_in.search(text)
@@ -300,8 +326,13 @@ def extract_schedule_args(rest: str) -> dict:
         if not picks:
             break
         kind, match = max(picks, key=lambda item: item[1].start())
-        sec = parse_duration_token(match.group(1))
+        token = match.group(1).strip()
+        sec = parse_duration_token(token)
         if sec is None:
+            error = (
+                f"Could not parse duration `{token}` after **{kind}**. "
+                f"Use e.g. `30m`, `1h`, `2h30m`, or `30 minutes`."
+            )
             break
         if kind == "in":
             start_in_sec = sec
@@ -309,10 +340,22 @@ def extract_schedule_args(rest: str) -> dict:
             duration_sec = sec
         text = text[: match.start()].strip()
 
+    # Fail closed: bare trailing "in …" / "for …" that didn't parse must not become a song title
+    if error is None:
+        dangling = re.search(r"\b(in|for)\s+(\S+(?:\s+\S+){0,3})\s*$", text, re.I)
+        if dangling:
+            maybe = parse_duration_token(dangling.group(2).replace(" ", ""))
+            if maybe is None and re.search(r"\d", dangling.group(2)):
+                error = (
+                    f"Looks like a timer (`{dangling.group(0).strip()}`) but duration is invalid. "
+                    f"Use `in 30m` (wait then put up) or `for 1h` (start now, auto take-down)."
+                )
+
     return {
         "song_rest": text,
         "start_in_sec": start_in_sec,
         "duration_sec": duration_sec,
+        "error": error,
     }
 
 
@@ -817,6 +860,9 @@ def build_scheduled_announce_embed(state: dict) -> discord.Embed:
     lines = [
         f"Song: {song_line(state)}",
         "",
+        "🔒 **NOT LIVE YET** — do not submit scores.",
+        "This is only a heads-up. The attack is **not** open until the put-up time.",
+        "",
         f"⏱️ **Goes live:** <t:{start_at}:F> · <t:{start_at}:R>",
     ]
     if end_at:
@@ -824,13 +870,14 @@ def build_scheduled_announce_embed(state: dict) -> discord.Embed:
     elif dur:
         lines.append(f"⏱️ **Runs for:** {format_duration(int(dur))} after start")
     lines.append("")
-    lines.append("Scores open when the event goes live. Operators: `!sa cancel` to scrap the timer.")
+    lines.append("When it goes live you will see a green **LIVE** post + scores thread.")
+    lines.append("Operators: `!sa cancel` to scrap this timer.")
     emb = discord.Embed(
-        title="📅 Surprise Attack scheduled",
+        title="📅 Surprise Attack scheduled (not open)",
         description="\n".join(lines),
         color=0xEAB308,
     )
-    emb.set_footer(text="Put-up timer set")
+    emb.set_footer(text="Put-up timer — scores closed until go-live")
     return emb
 
 
@@ -1181,14 +1228,24 @@ async def finish_live_event(*, auto: bool = False) -> dict:
 
 
 async def post_scheduled_notice(state: dict) -> None:
+    """
+    Heads-up only. Do NOT open a scores thread or post the full mode leaderboard —
+    that looks like the event is live and people start reacting/submitting early.
+    """
     channel = await get_sa_channel()
     if not channel:
         return
     try:
         msg = await channel.send(embed=build_scheduled_announce_embed(state))
         state["announce_message_id"] = msg.id
+        # Clear any prior board id so we force a fresh LIVE board at put-up time
+        state["board_message_id"] = None
         save_state(state)
-        await update_board(state, force_new=True)
+        print(
+            f"Scheduled notice posted (NOT live). "
+            f"put-up unix={state.get('scheduled_start_at')} "
+            f"song={state.get('song_title')!r}"
+        )
     except discord.HTTPException as e:
         print(f"Scheduled announce failed: {e}")
 
@@ -1199,37 +1256,51 @@ async def scheduler_tick() -> None:
         state = load_state()
         now = int(time.time())
 
-        # Put-up
+        # Put-up — only when not active and absolute start time has been reached
         start_at = state.get("scheduled_start_at")
-        if start_at and not state.get("active") and now >= int(start_at):
-            title = state.get("song_title")
-            artist = state.get("song_artist")
-            duration = state.get("scheduled_duration_sec")
-            # If end was pre-computed as absolute from schedule time, convert to remaining duration
-            end_at = state.get("scheduled_end_at")
-            if end_at and not duration:
-                remaining = int(end_at) - now
-                duration = remaining if remaining > 0 else None
-            print(f"Scheduler: putting up event song={title!r}")
-            await begin_live_event(
-                title=title,
-                artist=artist,
-                duration_sec=int(duration) if duration else None,
-                preserve_board=True,
-            )
-            channel = await get_sa_channel()
-            if channel:
-                try:
-                    st = load_state()
-                    note = f"⚡ **Surprise Attack is LIVE** (timer) · {song_line(st)}"
-                    if st.get("scheduled_end_at"):
-                        note += f"\nTake-down: <t:{int(st['scheduled_end_at'])}:R>"
-                    if st.get("submit_thread_id"):
-                        note += f"\nScores: <#{st['submit_thread_id']}>"
-                    await channel.send(note)
-                except discord.HTTPException:
-                    pass
-            return
+        if start_at and not state.get("active"):
+            start_at_i = int(start_at)
+            if now < start_at_i:
+                # Still waiting — never promote early
+                pass
+            else:
+                title = state.get("song_title")
+                artist = state.get("song_artist")
+                duration = state.get("scheduled_duration_sec")
+                # If end was pre-computed as absolute from schedule time, convert to remaining
+                end_at = state.get("scheduled_end_at")
+                if end_at and not duration:
+                    remaining = int(end_at) - now
+                    duration = remaining if remaining > 0 else None
+                late_by = now - start_at_i
+                print(
+                    f"Scheduler: putting up event song={title!r} "
+                    f"(due unix={start_at_i}, late_by={late_by}s)"
+                )
+                # Clear schedule stamp before go-live so a crash mid-start can't double-fire
+                state_clear = load_state()
+                state_clear["scheduled_start_at"] = None
+                save_state(state_clear)
+
+                await begin_live_event(
+                    title=title,
+                    artist=artist,
+                    duration_sec=int(duration) if duration else None,
+                    preserve_board=False,  # always new LIVE board at real put-up
+                )
+                channel = await get_sa_channel()
+                if channel:
+                    try:
+                        st = load_state()
+                        note = f"⚡ **Surprise Attack is LIVE** (timer) · {song_line(st)}"
+                        if st.get("scheduled_end_at"):
+                            note += f"\nTake-down: <t:{int(st['scheduled_end_at'])}:R>"
+                        if st.get("submit_thread_id"):
+                            note += f"\nScores: <#{st['submit_thread_id']}>"
+                        await channel.send(note)
+                    except discord.HTTPException:
+                        pass
+                return
 
         # Take-down
         state = load_state()
@@ -1366,12 +1437,16 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             return
 
         sched = extract_schedule_args(rest)
+        if sched.get("error"):
+            await message.reply(sched["error"], mention_author=False)
+            return
+
         start_in = sched["start_in_sec"]
         duration = sched["duration_sec"]
         song_rest = sched["song_rest"]
         title, artist = parse_title_artist(song_rest) if song_rest else (None, None)
 
-        # Delayed put-up
+        # Delayed put-up — never open scores / LIVE board until timer fires
         if start_in:
             if state.get("scheduled_start_at") and not state.get("active"):
                 await message.reply(
@@ -1382,26 +1457,32 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
                 return
 
             now = int(time.time())
+            go_live_at = now + int(start_in)
             state = empty_state()
             state["active"] = False
             state["song_title"] = title
             state["song_artist"] = artist
             state["channel_id"] = SA_CHANNEL_ID
-            state["scheduled_start_at"] = now + int(start_in)
+            state["scheduled_start_at"] = go_live_at
             if duration:
                 state["scheduled_duration_sec"] = int(duration)
-                state["scheduled_end_at"] = state["scheduled_start_at"] + int(duration)
+                state["scheduled_end_at"] = go_live_at + int(duration)
             else:
                 state["scheduled_duration_sec"] = None
                 state["scheduled_end_at"] = None
             save_state(state)
+            print(
+                f"Schedule armed: put-up in {start_in}s (unix {go_live_at}) "
+                f"duration={duration} song={title!r}"
+            )
             await post_scheduled_notice(state)
 
             reply = (
                 f"📅 **Put-up scheduled** in {format_duration(start_in)}\n"
                 f"Song: {song_line(state)}\n"
-                f"Goes live: <t:{state['scheduled_start_at']}:F> · "
-                f"<t:{state['scheduled_start_at']}:R>"
+                f"Goes live: <t:{go_live_at}:F> · <t:{go_live_at}:R>\n"
+                f"_A yellow **not open** notice was posted — that is **not** the live event. "
+                f"Scores stay closed until then._"
             )
             if duration:
                 reply += (
