@@ -99,7 +99,42 @@ Screenshot OCR: ready
 ```
 
 3. Discord: bot should show **Online**
-4. In `#sa`: `!sa where` then `!sa start Test Song`
+4. In `#sa`: `!sa where` then `!sa start Test Song`  
+5. **`!sa help` must show** `build 2026-07-15-timers-v3` (or newer `BOT_VERSION`) **and a TIMERS section**. If not, Discord is still on an old process.  
+6. A real restart usually **blips the bot offline** briefly. Redeploy with **no** offline blip often means the instance didn’t actually restart (or wrong service).
+
+### Prove the live build (Lesnar / operators)
+
+Render **Logs** after start should include:
+
+```text
+SA BOT ONLINE  BOT_VERSION=2026-07-15-timers-v3
+```
+
+Hard restart if needed: **Suspend** until Discord shows offline → **Resume**.  
+Optional nuclear: reset Discord **bot token**, update Render `DISCORD_TOKEN` once, redeploy (only one host should use the token).
+
+**Deploy Hook** (Settings → Deploy Hook) is a secret URL to *trigger* a deploy from outside tools.  
+**Regenerating** it only rotates that URL — it does **not** by itself load new bot code. Use Manual Deploy / Suspend-Resume for “get new code live.”
+
+### Build Filters (optional, recommended)
+
+Render → service → **Settings** → **Build Filters**  
+*Include or ignore specific paths when determining whether to trigger an auto-deploy. Paths are relative to the repo root.*
+
+**Why use them:** Auto-deploy only when bot code changes — not every README/docs push.
+
+**Suggested for this repo (include):**
+
+```text
+surprise_attack_bot.py
+requirements.txt
+render.yaml
+```
+
+Or ignore noise (exclude), e.g. `*.md`, `history/**` if Render’s UI supports ignore rules that way.
+
+**Caveat:** If filters are too tight, a real code change in another path won’t deploy — widen include list if you add packages. After changing filters, still **Manual Deploy** once to confirm.
 
 ---
 
