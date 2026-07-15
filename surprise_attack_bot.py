@@ -36,6 +36,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Bump this on every deploy-critical fix so !sa help proves which build is live.
+BOT_VERSION = "2026-07-15-timers-v2"
+
 BOT_DIR = Path(__file__).resolve().parent
 
 # === CONFIG ===
@@ -1340,31 +1343,64 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
     rest = cmd["rest"]
     state = load_state()
 
-    if action in ("help", "?", "commands"):
-        await message.reply(
-            "**Surprise Attack bot**\n"
-            "```\n"
-            "!sa start [Song - Artist]              start now\n"
-            "!sa start [Song - Artist] for 1h       start now, auto take-down\n"
-            "!sa start [Song - Artist] in 30m       schedule put-up\n"
-            "!sa start [Song - Artist] in 30m for 1h\n"
-            "!sa end                                take down now\n"
-            "!sa end in 45m                         schedule take-down\n"
-            "!sa cancel                             cancel pending timers\n"
-            "!sa status                             live + timers + channel\n"
-            "!sa where                              bound channel check\n"
-            "!sa board                              refresh leaderboard\n"
-            "!sa fake <mode> <score> [name]         test board (operator)\n"
-            "!sa clear [bot|all] [limit]            clear messages\n"
-            "!sa help                               this message\n"
-            "```\n"
-            "Durations: `30m`, `1h`, `2h30m`, or bare minutes (`90` = 90m).\n"
-            "On start the bot opens a **scores thread** — players post there.\n"
-            "Leaderboard stays in the main channel (Arcade / Classic / Fusion).\n\n"
-            "Bot needs **Create Public Threads** (+ Manage Threads to lock on end).\n"
-            "_Channel IDs are per-server — test and live always use different env values._",
-            mention_author=False,
+    if action in ("help", "?", "commands", "timer", "timers"):
+        # Embed so timer lines cannot get lost / look like an old short help list.
+        emb = discord.Embed(
+            title="Surprise Attack — commands",
+            color=0xFACC15,
+            description=(
+                f"**Build:** `{BOT_VERSION}`\n"
+                "If this build string is missing, Render is still on an **old** deploy."
+            ),
         )
+        emb.add_field(
+            name="⏱️ Timers (put-up / take-down)",
+            value=(
+                "```\n"
+                "!sa start Song - Artist for 1h\n"
+                "    start NOW, auto take-down after 1 hour\n"
+                "!sa start Song - Artist in 30m\n"
+                "    schedule put-up in 30 minutes (not live yet)\n"
+                "!sa start Song - Artist in 30m for 1h\n"
+                "    put-up in 30m, then run 1 hour\n"
+                "!sa end in 45m\n"
+                "    schedule take-down (event stays live until then)\n"
+                "!sa cancel\n"
+                "    cancel pending put-up OR take-down timer\n"
+                "!sa status\n"
+                "    show live/scheduled + any timers\n"
+                "```\n"
+                "Durations: `30m`, `1h`, `2h30m`, `90` (= 90 minutes), "
+                "`30 minutes`, `1 hour`."
+            ),
+            inline=False,
+        )
+        emb.add_field(
+            name="Event basics",
+            value=(
+                "```\n"
+                "!sa start [Song - Artist]     start now (no timer)\n"
+                "!sa end                       take down now\n"
+                "!sa board                     refresh leaderboard\n"
+                "!sa where                     bound channel check\n"
+                "!sa fake <mode> <score> [name]\n"
+                "!sa clear [bot|all] [limit]\n"
+                "!sa help                      this message\n"
+                "```"
+            ),
+            inline=False,
+        )
+        emb.add_field(
+            name="Notes",
+            value=(
+                "• Run commands in the **bound** `#sa` channel (`!sa where`).\n"
+                "• Yellow **scheduled** post ≠ live. Live = green LIVE + scores thread.\n"
+                "• Operators: Manage Server / Admin, or `SA_OPERATOR_ROLE_IDS`."
+            ),
+            inline=False,
+        )
+        emb.set_footer(text=f"SA bot {BOT_VERSION}")
+        await message.reply(embed=emb, mention_author=False)
         return
 
     if action in ("where", "config", "channel"):
@@ -1880,6 +1916,7 @@ async def handle_score_submission(message: discord.Message) -> None:
 @client.event
 async def on_ready():
     print(f"Surprise Attack bot logged in as {client.user} (id {client.user.id})")
+    print(f"BOT_VERSION={BOT_VERSION}")
     guilds = list(client.guilds)
     if guilds:
         print(f"Servers ({len(guilds)}):")
