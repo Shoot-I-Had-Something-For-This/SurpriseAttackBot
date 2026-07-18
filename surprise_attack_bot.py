@@ -8,7 +8,7 @@ One live channel per event:
   - One live leaderboard message with three mode sections
 
 Operator commands (role or Manage Server):
-  !sa start [Song - Artist]              start now
+  !sa start [Song - Artist] [on <diff>]  start now (optional difficulty lock)
   !sa start [Song - Artist] for 1h       start now, auto-end later
   !sa start [Song - Artist] in 30m       schedule put-up
   !sa start [Song - Artist] in 30m for 1h
@@ -16,6 +16,11 @@ Operator commands (role or Manage Server):
   !sa end in 45m                         schedule take-down
   !sa cancel                             cancel pending start/end timers
   !sa status / board / help
+
+Difficulty lock (optional on start):
+  on easy|normal|hard|extreme|hardcore
+  also: difficulty hardcore · diff hard · @ extreme
+  Omit = any difficulty accepted (legacy behavior).
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-15-timers-v3"
+BOT_VERSION = "2026-07-17-difficulty-v1"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -100,6 +105,7 @@ DIFFICULTY_MAP = {
     "extreme": "extreme",
     "hardcore": "hardcore",
 }
+DIFFICULTY_CHOICES = ("easy", "normal", "hard", "extreme", "hardcore")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -118,6 +124,8 @@ def empty_state() -> dict:
         "event_id": None,
         "song_title": None,
         "song_artist": None,
+        # Optional lock: only scores at this difficulty count (None = any).
+        "event_difficulty": None,
         "started_at": None,
         "ended_at": None,
         "channel_id": None,
@@ -185,6 +193,11 @@ def is_game_footer(text: str) -> bool:
 def normalize_difficulty(raw: str) -> str:
     key = (raw or "").lower().strip()
     return DIFFICULTY_MAP.get(key, key if key in DIFFICULTY_MAP.values() else "normal")
+
+
+def is_known_difficulty(raw: str | None) -> bool:
+    key = (raw or "").lower().strip()
+    return key in DIFFICULTY_MAP or key in DIFFICULTY_CHOICES
 
 
 def normalize_game_mode(raw: str) -> str:
@@ -360,6 +373,79 @@ def extract_schedule_args(rest: str) -> dict:
         "duration_sec": duration_sec,
         "error": error,
     }
+
+
+def extract_difficulty_arg(rest: str) -> dict:
+    """
+    Strip an optional difficulty lock from start rest (after schedule args).
+
+    Accepted forms (case-insensitive):
+      on hardcore
+      difficulty hard
+      diff extreme
+      @ easy
+
+    Omit entirely → any difficulty allowed.
+    """
+    text = (rest or "").strip()
+    if not text:
+        return {"difficulty": None, "song_rest": "", "error": None}
+
+    # Flag + name (prefer explicit keywords so song titles stay intact)
+    pat = re.compile(
+        r"(?:^|\s)(?:on|@|diff(?:iculty)?)\s+"
+        r"(easy|normal|hard|extreme|hardcore)\b",
+        re.I,
+    )
+    matches = list(pat.finditer(text))
+    if len(matches) > 1:
+        return {
+            "difficulty": None,
+            "song_rest": text,
+            "error": (
+                "Only one difficulty flag allowed. "
+                "Examples: `on hardcore`, `difficulty hard`, `diff extreme`."
+            ),
+        }
+    if matches:
+        m = matches[0]
+        diff = normalize_difficulty(m.group(1))
+        song_rest = f"{text[: m.start()]} {text[m.end() :]}".strip()
+        song_rest = re.sub(r"\s+", " ", song_rest).strip(" -–—|")
+        return {"difficulty": diff, "song_rest": song_rest, "error": None}
+
+    # Bare trailing difficulty word only (e.g. `!sa start Song hardcore`)
+    bare = re.search(
+        r"(?:^|\s)(easy|normal|hard|extreme|hardcore)\s*$",
+        text,
+        re.I,
+    )
+    if bare:
+        # Don't steal a one-word song title that IS a difficulty name unless flagged.
+        # Bare form only when there is song text before the trailing word.
+        before = text[: bare.start()].strip()
+        if before:
+            diff = normalize_difficulty(bare.group(1))
+            song_rest = before.strip(" -–—|")
+            return {"difficulty": diff, "song_rest": song_rest, "error": None}
+
+    # Unknown "on/diff/@" token that looks like a failed difficulty flag
+    dangling = re.search(
+        r"(?:^|\s)(?:on|@|diff(?:iculty)?)\s+(\S+)\s*$",
+        text,
+        re.I,
+    )
+    if dangling and not is_known_difficulty(dangling.group(1)):
+        return {
+            "difficulty": None,
+            "song_rest": text,
+            "error": (
+                f"Unknown difficulty `{dangling.group(1)}`. "
+                f"Use one of: {', '.join(DIFFICULTY_CHOICES)}."
+            ),
+        }
+
+    return {"difficulty": None, "song_rest": text, "error": None}
 
 
 def clear_schedule_fields(state: dict) -> None:
@@ -697,6 +783,20 @@ def record_score(state: dict, data: dict, discord_user_id: int | None = None) ->
                 ),
             }
 
+    # Optional difficulty lock for the event
+    event_diff = state.get("event_difficulty")
+    if event_diff:
+        want = normalize_difficulty(event_diff)
+        got = normalize_difficulty(difficulty)
+        if got != want:
+            return {
+                "rejected": True,
+                "reason": (
+                    f"wrong difficulty (event is **{difficulty_label(want)}** only; "
+                    f"got **{difficulty_label(got)}**)"
+                ),
+            }
+
     key = player_key(player)
     bucket = state["scores"].setdefault(mode, {})
     existing = bucket.get(key)
@@ -768,6 +868,14 @@ def song_line(state: dict) -> str:
     return "_Any song (no filter)_"
 
 
+def difficulty_line(state: dict) -> str:
+    """Event difficulty lock for status / board / announce."""
+    d = state.get("event_difficulty")
+    if d and is_known_difficulty(d):
+        return f"**{difficulty_label(d)}** only"
+    return "_Any difficulty_"
+
+
 def timer_lines(state: dict) -> list[str]:
     """Human-readable schedule lines for status / board."""
     lines: list[str] = []
@@ -797,6 +905,7 @@ def build_board_embeds(state: dict) -> list[discord.Embed]:
     desc_parts = [
         f"**Status:** {status}",
         f"**Song:** {song_line(state)}",
+        f"**Difficulty:** {difficulty_line(state)}",
         f"**Event:** `{state.get('event_id') or '—'}`",
     ]
     desc_parts.extend(timer_lines(state))
@@ -807,7 +916,7 @@ def build_board_embeds(state: dict) -> list[discord.Embed]:
         description="\n".join(desc_parts),
         color=color,
     )
-    header.set_footer(text="One board · three modes · forward your score here")
+    header.set_footer(text="One board · three modes · difficulty from event start")
 
     embeds = [header]
     for mode in MODES:
@@ -833,12 +942,26 @@ def build_announce_embed(state: dict) -> discord.Embed:
         end_at = int(state["scheduled_end_at"])
         end_note = f"\n\n⏱️ **Auto take-down:** <t:{end_at}:F> · <t:{end_at}:R>"
 
+    diff_note = ""
+    if state.get("event_difficulty"):
+        diff_note = (
+            f"\n**Difficulty:** {difficulty_line(state)} "
+            "(other difficulties are rejected)"
+        )
+
     emb = discord.Embed(
         title="⚡ Surprise Attack is LIVE",
         description=(
-            f"Song: {song_line(state)}\n\n"
+            f"Song: {song_line(state)}"
+            f"{diff_note}\n\n"
             "**How to play**\n"
-            "1. Play the song (Arcade, Classic, or Fusion)\n"
+            "1. Play the song (Arcade, Classic, or Fusion)"
+            + (
+                f" on **{difficulty_label(state['event_difficulty'])}**"
+                if state.get("event_difficulty")
+                else ""
+            )
+            + "\n"
             "2. Results → **Discord → Submit Score**, *or* take a scoreboard screenshot\n"
             f"3. Post it in {where}\n\n"
             "The bot sorts your score into Arcade / Classic / Fusion automatically.\n"
@@ -862,6 +985,7 @@ def build_scheduled_announce_embed(state: dict) -> discord.Embed:
     dur = state.get("scheduled_duration_sec")
     lines = [
         f"Song: {song_line(state)}",
+        f"Difficulty: {difficulty_line(state)}",
         "",
         "🔒 **NOT LIVE YET** — do not submit scores.",
         "This is only a heads-up. The attack is **not** open until the put-up time.",
@@ -1096,6 +1220,7 @@ def archive_event(state: dict) -> Path | None:
         "event_id": state.get("event_id"),
         "song_title": state.get("song_title"),
         "song_artist": state.get("song_artist"),
+        "event_difficulty": state.get("event_difficulty"),
         "started_at": state.get("started_at"),
         "ended_at": state.get("ended_at"),
         "scores": state.get("scores"),
@@ -1130,11 +1255,13 @@ async def begin_live_event(
     title: str | None,
     artist: str | None,
     duration_sec: int | None = None,
+    difficulty: str | None = None,
     preserve_board: bool = False,
 ) -> dict:
     """
     Open a live event: announce, scores thread, board.
     duration_sec → auto take-down after that many seconds.
+    difficulty → optional lock (easy/normal/hard/extreme/hardcore); None = any.
     """
     state = empty_state()
     # Keep board message id if we're promoting a pre-announce in same channel
@@ -1148,6 +1275,10 @@ async def begin_live_event(
     state["event_id"] = new_event_id()
     state["song_title"] = title
     state["song_artist"] = artist
+    if difficulty and is_known_difficulty(difficulty):
+        state["event_difficulty"] = normalize_difficulty(difficulty)
+    else:
+        state["event_difficulty"] = None
     state["started_at"] = now
     state["channel_id"] = SA_CHANNEL_ID
     state["scores"] = {m: {} for m in MODES}
@@ -1204,6 +1335,7 @@ async def finish_live_event(*, auto: bool = False) -> dict:
         f"**Surprise Attack ended** `{state.get('event_id')}`"
         + (" _(timer)_" if auto else ""),
         f"Song: {song_line(state)}",
+        f"Difficulty: {difficulty_line(state)}",
     ]
     for mode in MODES:
         rows = ranked_mode_scores(state, mode, limit=3)
@@ -1269,6 +1401,7 @@ async def scheduler_tick() -> None:
             else:
                 title = state.get("song_title")
                 artist = state.get("song_artist")
+                event_diff = state.get("event_difficulty")
                 duration = state.get("scheduled_duration_sec")
                 # If end was pre-computed as absolute from schedule time, convert to remaining
                 end_at = state.get("scheduled_end_at")
@@ -1278,6 +1411,7 @@ async def scheduler_tick() -> None:
                 late_by = now - start_at_i
                 print(
                     f"Scheduler: putting up event song={title!r} "
+                    f"diff={event_diff!r} "
                     f"(due unix={start_at_i}, late_by={late_by}s)"
                 )
                 # Clear schedule stamp before go-live so a crash mid-start can't double-fire
@@ -1289,13 +1423,17 @@ async def scheduler_tick() -> None:
                     title=title,
                     artist=artist,
                     duration_sec=int(duration) if duration else None,
+                    difficulty=event_diff,
                     preserve_board=False,  # always new LIVE board at real put-up
                 )
                 channel = await get_sa_channel()
                 if channel:
                     try:
                         st = load_state()
-                        note = f"⚡ **Surprise Attack is LIVE** (timer) · {song_line(st)}"
+                        note = (
+                            f"⚡ **Surprise Attack is LIVE** (timer) · {song_line(st)}\n"
+                            f"Difficulty: {difficulty_line(st)}"
+                        )
                         if st.get("scheduled_end_at"):
                             note += f"\nTake-down: <t:{int(st['scheduled_end_at'])}:R>"
                         if st.get("submit_thread_id"):
@@ -1348,25 +1486,30 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         help_text = (
             f"**Surprise Attack bot** · build `{BOT_VERSION}`\n"
             f"_If you do not see this build string, Render is not running this commit._\n\n"
-            f"**TIMERS (put-up / take-down)**\n"
+            f"**START + DIFFICULTY + TIMERS**\n"
             f"```\n"
-            f"!sa start Song - Artist for 1h\n"
-            f"    start NOW, auto take-down after 1 hour\n"
-            f"!sa start Song - Artist in 30m\n"
-            f"    schedule put-up in 30 minutes (not live yet)\n"
-            f"!sa start Song - Artist in 30m for 1h\n"
-            f"    put-up in 30m, then run 1 hour\n"
+            f"!sa start Song - Artist on hardcore\n"
+            f"    start NOW · only Hardcore scores count\n"
+            f"!sa start Song - Artist on hard for 1h\n"
+            f"    start NOW · Hard only · auto take-down after 1h\n"
+            f"!sa start Song - Artist in 30m on extreme\n"
+            f"    schedule put-up · Extreme only\n"
+            f"!sa start Song - Artist in 30m for 1h on hardcore\n"
+            f"    put-up in 30m · run 1h · Hardcore only\n"
+            f"!sa start Song - Artist\n"
+            f"    start NOW · any difficulty (no lock)\n"
             f"!sa end in 45m\n"
             f"    schedule take-down (event stays live until then)\n"
             f"!sa cancel\n"
             f"    cancel pending put-up OR take-down timer\n"
             f"!sa status\n"
-            f"    show live/scheduled + any timers\n"
+            f"    show live/scheduled + song + difficulty + timers\n"
             f"```\n"
+            f"Difficulty: `easy` `normal` `hard` `extreme` `hardcore`\n"
+            f"Flags: `on hardcore` · `difficulty hard` · `diff extreme` · `@ easy`\n"
             f"Durations: `30m`, `1h`, `2h30m`, `90` (= 90m), `30 minutes`, `1 hour`.\n\n"
             f"**Event basics**\n"
             f"```\n"
-            f"!sa start [Song - Artist]     start now (no timer)\n"
             f"!sa end                       take down now\n"
             f"!sa board                     refresh leaderboard\n"
             f"!sa where                     bound channel check\n"
@@ -1415,6 +1558,7 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
                 [
                     f"**LIVE** `{state.get('event_id')}`",
                     f"Song: {song_line(state)}",
+                    f"Difficulty: {difficulty_line(state)}",
                 ]
             )
             if state.get("submit_thread_id"):
@@ -1425,11 +1569,15 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         elif state.get("scheduled_start_at"):
             lines.append("**SCHEDULED** (not live yet)")
             lines.append(f"Song: {song_line(state)}")
+            lines.append(f"Difficulty: {difficulty_line(state)}")
             lines.extend(timer_lines(state))
             lines.append("Operators: `!sa cancel` to scrap · `!sa start …` to go live now")
         else:
             lines.append("No Surprise Attack is live or scheduled.")
-            lines.append("Operators: `!sa start Song - Artist` or `!sa start Song in 30m for 1h`")
+            lines.append(
+                "Operators: `!sa start Song - Artist on hardcore` "
+                "or `!sa start Song in 30m for 1h on hard`"
+            )
         await message.reply("\n".join(lines), mention_author=False)
         return
 
@@ -1450,13 +1598,20 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             )
             return
 
-        sched = extract_schedule_args(rest)
+        # Difficulty first so `… for 1h on hardcore` still parses timers cleanly.
+        diff_parsed = extract_difficulty_arg(rest)
+        if diff_parsed.get("error"):
+            await message.reply(diff_parsed["error"], mention_author=False)
+            return
+
+        sched = extract_schedule_args(diff_parsed["song_rest"])
         if sched.get("error"):
             await message.reply(sched["error"], mention_author=False)
             return
 
         start_in = sched["start_in_sec"]
         duration = sched["duration_sec"]
+        event_diff = diff_parsed["difficulty"]
         song_rest = sched["song_rest"]
         title, artist = parse_title_artist(song_rest) if song_rest else (None, None)
 
@@ -1476,6 +1631,7 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             state["active"] = False
             state["song_title"] = title
             state["song_artist"] = artist
+            state["event_difficulty"] = event_diff
             state["channel_id"] = SA_CHANNEL_ID
             state["scheduled_start_at"] = go_live_at
             if duration:
@@ -1487,13 +1643,14 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             save_state(state)
             print(
                 f"Schedule armed: put-up in {start_in}s (unix {go_live_at}) "
-                f"duration={duration} song={title!r}"
+                f"duration={duration} song={title!r} diff={event_diff!r}"
             )
             await post_scheduled_notice(state)
 
             reply = (
                 f"📅 **Put-up scheduled** in {format_duration(start_in)}\n"
                 f"Song: {song_line(state)}\n"
+                f"Difficulty: {difficulty_line(state)}\n"
                 f"Goes live: <t:{go_live_at}:F> · <t:{go_live_at}:R>\n"
                 f"_A yellow **not open** notice was posted — that is **not** the live event. "
                 f"Scores stay closed until then._"
@@ -1512,6 +1669,7 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             title=title,
             artist=artist,
             duration_sec=int(duration) if duration else None,
+            difficulty=event_diff,
         )
         thread_id = state.get("submit_thread_id") or state.get("_thread_id")
         thread_note = (
@@ -1523,6 +1681,7 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         reply = (
             f"Surprise Attack **started** `{state['event_id']}`\n"
             f"Song: {song_line(state)}\n"
+            f"Difficulty: {difficulty_line(state)}\n"
             f"{thread_note}\n"
             "Leaderboard stays in this channel."
         )
@@ -1729,7 +1888,8 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             "playerName": player,
             "score": score,
             "gameMode": mode,
-            "difficulty": "hard",
+            # Match event lock when set so operator tests are not auto-rejected
+            "difficulty": state.get("event_difficulty") or "hard",
             "title": state.get("song_title") or "Test Song",
             "artist": state.get("song_artist") or "",
             "maxCombo": 0,

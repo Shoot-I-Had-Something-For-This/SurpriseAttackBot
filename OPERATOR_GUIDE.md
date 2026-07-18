@@ -43,22 +43,28 @@ Type these in **`#sa-live`**.
 ### Start an event
 
 ```
-!sa start Song Name - Artist
+!sa start Song Name - Artist [on <difficulty>] [in <when>] [for <how long>]
 ```
 
 Examples:
 
 ```
 !sa start Danger - Shotty Horroh
-!sa start Enter Sandman
+!sa start Danger - Shotty Horroh on hardcore
+!sa start Enter Sandman on hard for 1h
 !sa start
 !sa start Danger - Shotty Horroh for 1h
-!sa start Danger - Shotty Horroh in 30m
-!sa start Danger - Shotty Horroh in 30m for 1h
+!sa start Danger - Shotty Horroh in 30m on extreme
+!sa start Danger - Shotty Horroh in 30m for 1h on hardcore
 ```
 
 - With a song name: only matching scores count (best-effort title match).
 - Without a song: any song is accepted (useful for testing).
+- **Difficulty (optional):** lock the event to one difficulty. Wrong-difficulty scores are **rejected**.
+  - Values: `easy` · `normal` · `hard` · `extreme` · `hardcore`
+  - Flags: `on hardcore` · `difficulty hard` · `diff extreme` · `@ easy`
+  - Or trailing bare word: `!sa start Song hardcore`
+  - **Omit** = any difficulty accepted (old behavior).
 - **`for 1h`** — auto **take-down** after that long (event still starts **now** unless you also use `in`).
 - **`in 30m`** — schedule **put-up** later. Bot posts a yellow **“not open”** notice only (no scores thread, no full board yet).
 - **`in 30m for 1h`** — put-up in 30m, then auto take-down after 1 hour of play.

@@ -39,7 +39,7 @@ python surprise_attack_bot.py
 3. In `#sa-live`:
 
 ```
-!sa start Your Song - Artist
+!sa start Your Song - Artist on hardcore
 ```
 
 4. Day-to-day use: **[OPERATOR_GUIDE.md](OPERATOR_GUIDE.md)**  
@@ -53,6 +53,7 @@ python surprise_attack_bot.py
 | Command | Who | What |
 |---------|-----|------|
 | `!sa start [Song - Artist]` | Operator | Open event + post board |
+| `!sa start … on hardcore` | Operator | Lock event to one difficulty (rejects others) |
 | `!sa start … for 1h` | Operator | Start now, auto take-down |
 | `!sa start … in 30m` | Operator | Schedule put-up |
 | `!sa start … in 30m for 1h` | Operator | Delayed start + duration |
@@ -101,3 +102,4 @@ Test server channel IDs are **not** production. Always re-point `.env`.
 - Scores are stored **locally** on the bot host (`sa_state.json` + `history/`). No Indies-DB / Supabase required.  
 - Fusion is supported as a third mode. If the game embed says something unexpected, the bot defaults to Classic and logs it.  
 - Song filter is best-effort title matching when you pass a song to `!sa start`.
+- Difficulty lock is optional: `on easy|normal|hard|extreme|hardcore` (also `difficulty …`, `diff …`, `@ …`). Omit = any difficulty.
