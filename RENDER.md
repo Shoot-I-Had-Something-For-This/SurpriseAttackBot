@@ -100,19 +100,43 @@ Screenshot OCR: ready
 
 3. Discord: bot should show **Online**
 4. In `#sa`: `!sa where` then `!sa start Test Song`  
-5. **`!sa help` must show** `build 2026-07-15-timers-v3` (or newer `BOT_VERSION`) **and a TIMERS section**. If not, Discord is still on an old process.  
-6. A real restart usually **blips the bot offline** briefly. Redeploy with **no** offline blip often means the instance didn’t actually restart (or wrong service).
+5. **`!sa help` must show** `build 2026-07-17-difficulty-v1` (or newer `BOT_VERSION`) **and DIFFICULTY + TIMERS**. If you see `timers-v3` or no difficulty lines, Discord is still on an **old process**.  
+6. A real restart usually **blips the bot offline** briefly. “Redeploy” with **no** offline blip often means the instance didn’t actually restart (or wrong service).
 
 ### Prove the live build (Lesnar / operators)
 
-Render **Logs** after start should include:
+**Git is not the usual problem anymore.** As of 2026-07-17, both of these remotes serve the same `main` tip (`3948252`, `BOT_VERSION=2026-07-17-difficulty-v1`):
 
-```text
-SA BOT ONLINE  BOT_VERSION=2026-07-15-timers-v3
-```
+- `https://github.com/JStillxSKS/SurpriseAttackBot` (redirect / old URL)
+- `https://github.com/Shoot-I-Had-Something-For-This/SurpriseAttackBot` (canonical)
 
-Hard restart if needed: **Suspend** until Discord shows offline → **Resume**.  
-Optional nuclear: reset Discord **bot token**, update Render `DISCORD_TOKEN` once, redeploy (only one host should use the token).
+If Discord still looks wrong, **Render is not running that commit** (or env points at the wrong channel).
+
+#### 60-second alignment checklist
+
+| # | Check | Pass looks like |
+|---|--------|------------------|
+| 1 | Render service → **Settings → Build & Deploy → Repo** | Same org/user + `SurpriseAttackBot`, branch **`main`** |
+| 2 | Latest **Deploy** → commit message / SHA | Mentions difficulty lock **or** SHA starts `3948252…` |
+| 3 | Deploy finished **Live** (not failed / not stuck building) | Green Live |
+| 4 | **Logs** after boot | `SA BOT ONLINE  BOT_VERSION=2026-07-17-difficulty-v1` |
+| 5 | Discord bot goes **offline briefly** on that deploy | Real process restart |
+| 6 | In the SA channel: `!sa help` | Build string **`2026-07-17-difficulty-v1`** + difficulty examples |
+| 7 | `!sa where` | ✅ matches this channel (not ❌) |
+
+If **4** is new but **6** is old → wrong bot token / second host still online.  
+If **6** is new but commands “do nothing” → **`SA_CHANNEL_ID`** wrong (channel wipe / new channel).  
+If deploy never shows `3948252` → wrong GitHub repo on the service, or **Build Filters** blocked the path, or they clicked an old deploy.
+
+#### Hard restart (when “redeploy” lied)
+
+1. Render → service → **Suspend**  
+2. Wait until Discord shows the bot **offline**  
+3. **Resume** (or **Manual Deploy → Clear build cache & deploy**)  
+4. Re-check Logs for `BOT_VERSION=2026-07-17-difficulty-v1`  
+5. Discord: `!sa help` again  
+
+Optional nuclear: reset Discord **bot token**, set Render `DISCORD_TOKEN` once, deploy (only **one** host should use the token).
 
 **Deploy Hook** (Settings → Deploy Hook) is a secret URL to *trigger* a deploy from outside tools.  
 **Regenerating** it only rotates that URL — it does **not** by itself load new bot code. Use Manual Deploy / Suspend-Resume for “get new code live.”
