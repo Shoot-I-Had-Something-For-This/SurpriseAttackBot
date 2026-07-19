@@ -16,11 +16,16 @@ Operator commands (role or Manage Server):
   !sa end in 45m                         schedule take-down
   !sa cancel                             cancel pending start/end timers
   !sa status / board / help
+  !sa scan [limit]   re-read past score posts into the live board
+  !sa players        show loaded roster (names + hashes)
 
 Difficulty lock (optional on start):
   on easy|normal|hard|extreme|hardcore
   also: difficulty hardcore · diff hard · @ extreme
   Omit = any difficulty accepted (legacy behavior).
+
+Player roster (optional): players.txt — Discord/alias - SmashName (hash)
+  Used to normalize names when score embeds include the short Meta hash.
 """
 
 from __future__ import annotations
@@ -42,12 +47,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-17-difficulty-v1"
+BOT_VERSION = "2026-07-19-scan-roster-v1"
 
 BOT_DIR = Path(__file__).resolve().parent
 
 # === CONFIG ===
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or "YOUR_BOT_TOKEN_HERE"
+
+# Player roster: Discord aliases + Smash display name + short hash (from score cards)
+PLAYERS_PATH = Path(os.getenv("SA_PLAYERS_PATH") or BOT_DIR / "players.txt")
 
 _channel_raw = os.getenv("SA_CHANNEL_ID", "").strip()
 SA_CHANNEL_ID = int(_channel_raw) if _channel_raw else None
@@ -183,6 +191,136 @@ def parse_player_name(name: str | None) -> str:
     if not name:
         return "Unknown"
     return re.sub(r"\s*\([^)]+\)\s*$", "", name).strip() or "Unknown"
+
+
+def parse_player_name_and_hash(name: str | None) -> tuple[str, str | None]:
+    """
+    Embed author is often `DisplayName (i8uYNfGK)`.
+    Returns (clean_name, short_hash or None).
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return "Unknown", None
+    m = re.match(r"^(.+?)\s*\(([A-Za-z0-9_-]{6,16})\)\s*$", raw)
+    if m:
+        base = m.group(1).strip() or "Unknown"
+        return base, m.group(2)
+    return parse_player_name(raw), None
+
+
+# ---------------------------------------------------------------------------
+# Player roster (names + hashes)
+# ---------------------------------------------------------------------------
+
+# hash_lower -> {smash_name, aliases, hash}
+# alias_lower -> hash_lower
+_PLAYER_BY_HASH: dict[str, dict] = {}
+_PLAYER_ALIAS_TO_HASH: dict[str, str] = {}
+
+
+def _register_player_alias(alias: str, hash_key: str) -> None:
+    a = player_key(alias)
+    if a and a != "unknown":
+        _PLAYER_ALIAS_TO_HASH[a] = hash_key
+
+
+def load_players_roster(path: Path | None = None) -> int:
+    """
+    Load players.txt lines like:
+      RedKnight56 (Kegen Brooks) - Kegen Brooks (3pWX8nv3)
+      Lana - lara (cDPuArtg)
+    Returns number of players loaded.
+    """
+    global _PLAYER_BY_HASH, _PLAYER_ALIAS_TO_HASH
+    _PLAYER_BY_HASH = {}
+    _PLAYER_ALIAS_TO_HASH = {}
+    p = path or PLAYERS_PATH
+    if not p.is_file():
+        print(f"Player roster: no file at {p} (optional)")
+        return 0
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Player roster read failed: {e}")
+        return 0
+
+    count = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Prefer hash in final (...)
+        hash_m = re.search(r"\(([A-Za-z0-9_-]{6,16})\)\s*$", line)
+        if not hash_m:
+            continue
+        player_hash = hash_m.group(1)
+        hash_key = player_hash.lower()
+        body = line[: hash_m.start()].strip().rstrip("-").strip()
+
+        smash_name = body
+        left_aliases: list[str] = []
+        if " - " in body:
+            left, right = body.rsplit(" - ", 1)
+            smash_name = right.strip() or left.strip()
+            left_aliases.append(left.strip())
+        # Also strip any remaining parentheticals on smash name for aliases
+        smash_clean = parse_player_name(smash_name)
+        aliases = {smash_clean, smash_name, player_hash}
+        for la in left_aliases:
+            aliases.add(la)
+            aliases.add(parse_player_name(la))
+            # "RedKnight56 (Kegen Brooks)" → also Kegen Brooks
+            for inner in re.findall(r"\(([^)]+)\)", la):
+                aliases.add(inner.strip())
+
+        entry = {
+            "hash": player_hash,
+            "smash_name": smash_clean,
+            "aliases": {a for a in aliases if a},
+        }
+        _PLAYER_BY_HASH[hash_key] = entry
+        for a in entry["aliases"]:
+            _register_player_alias(a, hash_key)
+        count += 1
+
+    print(f"Player roster: {count} player(s) from {p.name}")
+    return count
+
+
+def resolve_roster_player(
+    name: str | None,
+    player_hash: str | None = None,
+) -> tuple[str, str | None]:
+    """
+    Map embed name/hash to roster smash_name when known.
+    Returns (display_name, hash_or_none).
+    """
+    h = (player_hash or "").strip()
+    if h:
+        entry = _PLAYER_BY_HASH.get(h.lower())
+        if entry:
+            return entry["smash_name"], entry["hash"]
+    clean = parse_player_name(name)
+    if not h:
+        _, maybe_h = parse_player_name_and_hash(name)
+        if maybe_h:
+            h = maybe_h
+            entry = _PLAYER_BY_HASH.get(h.lower())
+            if entry:
+                return entry["smash_name"], entry["hash"]
+    key = player_key(clean)
+    hash_key = _PLAYER_ALIAS_TO_HASH.get(key)
+    if hash_key:
+        entry = _PLAYER_BY_HASH[hash_key]
+        return entry["smash_name"], entry["hash"]
+    return clean or "Unknown", h or None
+
+
+def player_storage_key(name: str, player_hash: str | None = None) -> str:
+    """Prefer stable hash key so renames don't split board rows."""
+    if player_hash:
+        return f"hash:{player_hash.lower()}"
+    return player_key(name)
 
 
 def is_game_footer(text: str) -> bool:
@@ -529,12 +667,22 @@ def parse_embed(embed: discord.Embed) -> dict | None:
     if artist_match:
         data["artist"] = artist_match.group(1).strip()
 
+    player_hash = None
     if embed.author and embed.author.name:
-        data["playerName"] = parse_player_name(embed.author.name)
+        pname, player_hash = parse_player_name_and_hash(embed.author.name)
+        data["playerName"] = pname
     elif embed.footer and embed.footer.text and not is_game_footer(embed.footer.text):
-        data["playerName"] = parse_player_name(embed.footer.text)
+        pname, player_hash = parse_player_name_and_hash(embed.footer.text)
+        data["playerName"] = pname
     else:
         data["playerName"] = "Unknown"
+    if player_hash:
+        data["playerHash"] = player_hash
+    # Roster: normalize smash display name from hash / aliases
+    resolved, rh = resolve_roster_player(data.get("playerName"), data.get("playerHash"))
+    data["playerName"] = resolved
+    if rh:
+        data["playerHash"] = rh
 
     if data.get("score") or data.get("title") or data.get("inGameSongId"):
         return data
@@ -614,7 +762,14 @@ def normalize_ocr_data(data: dict) -> dict:
         data["gameMode"] = "classic"
 
     if data.get("playerName"):
-        data["playerName"] = parse_player_name(str(data["playerName"]))
+        raw_pn = str(data["playerName"])
+        pname, ph = parse_player_name_and_hash(raw_pn)
+        if ph:
+            data["playerHash"] = ph
+        resolved, rh = resolve_roster_player(pname, data.get("playerHash"))
+        data["playerName"] = resolved
+        if rh:
+            data["playerHash"] = rh
 
     try:
         data["score"] = int(data.get("score") or 0)
@@ -761,7 +916,13 @@ def record_score(state: dict, data: dict, discord_user_id: int | None = None) ->
     if mode not in MODES:
         mode = "classic"
 
-    player = data.get("playerName") or "Unknown"
+    raw_name = data.get("playerName") or "Unknown"
+    player_hash = (data.get("playerHash") or "").strip() or None
+    player, player_hash = resolve_roster_player(raw_name, player_hash)
+    data["playerName"] = player
+    if player_hash:
+        data["playerHash"] = player_hash
+
     score = int(data.get("score") or 0)
     difficulty = normalize_difficulty(data.get("difficulty") or "normal")
     title = (data.get("title") or "").strip()
@@ -797,9 +958,15 @@ def record_score(state: dict, data: dict, discord_user_id: int | None = None) ->
                 ),
             }
 
-    key = player_key(player)
+    key = player_storage_key(player, player_hash)
     bucket = state["scores"].setdefault(mode, {})
     existing = bucket.get(key)
+    # Legacy rows keyed by name only — merge if hash now known
+    if not existing and player_hash:
+        legacy = bucket.get(player_key(player))
+        if legacy:
+            existing = legacy
+            bucket.pop(player_key(player), None)
     previous = int(existing["score"]) if existing else None
 
     if existing and score <= previous:
@@ -812,10 +979,12 @@ def record_score(state: dict, data: dict, discord_user_id: int | None = None) ->
             "previous": previous,
             "best": previous,
             "difficulty": difficulty,
+            "player_hash": player_hash,
         }
 
     bucket[key] = {
         "player_name": player,
+        "player_hash": player_hash,
         "score": score,
         "difficulty": difficulty,
         "title": title,
@@ -835,6 +1004,7 @@ def record_score(state: dict, data: dict, discord_user_id: int | None = None) ->
         "previous": previous,
         "best": score,
         "difficulty": difficulty,
+        "player_hash": player_hash,
     }
 
 
@@ -1513,10 +1683,15 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             f"!sa end                       take down now\n"
             f"!sa board                     refresh leaderboard\n"
             f"!sa where                     bound channel check\n"
+            f"!sa scan [limit]              re-read past score posts (default 100)\n"
+            f"!sa players                   show name/hash roster\n"
             f"!sa fake <mode> <score> [name]\n"
             f"!sa clear [bot|all] [limit]\n"
             f"!sa help / !sa version        this message\n"
             f"```\n"
+            f"**`!sa scan`** walks the scores thread (or this channel) history and counts "
+            f"embeds/screenshots toward the live board (personal bests only).\n"
+            f"Roster file: `players.txt` (Smash name + hash) for stable player rows.\n"
             f"Run commands in the **bound** SA channel (`!sa where`).\n"
             f"Yellow **scheduled** post is NOT live. Live = green LIVE + scores thread.\n"
             f"Operators: Manage Server / Admin, or `SA_OPERATOR_ROLE_IDS`."
@@ -1788,6 +1963,81 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         )
         return
 
+    if action in ("players", "roster", "names"):
+        if not _PLAYER_BY_HASH:
+            n = load_players_roster()
+            if n == 0:
+                await message.reply(
+                    f"No roster loaded. Add `players.txt` next to the bot "
+                    f"(or set `SA_PLAYERS_PATH`).\nExpected path: `{PLAYERS_PATH}`",
+                    mention_author=False,
+                )
+                return
+        lines = [f"**Player roster** ({len(_PLAYER_BY_HASH)} loaded)"]
+        for entry in sorted(_PLAYER_BY_HASH.values(), key=lambda e: e["smash_name"].lower()):
+            lines.append(f"• **{entry['smash_name']}** `({entry['hash']})`")
+        await message.reply("\n".join(lines), mention_author=False)
+        return
+
+    if action in ("scan", "backfill", "rescan", "history"):
+        if not state.get("active"):
+            await message.reply(
+                "Start an event first: `!sa start Song - Artist`\n"
+                "Then `!sa scan` to pull past score posts into that event.",
+                mention_author=False,
+            )
+            return
+
+        limit = 100
+        for p in rest.split():
+            if p.isdigit():
+                limit = max(1, min(int(p), 500))
+
+        # Prefer event scores thread; else this channel if it's the SA channel
+        scan_ch = None
+        tid = state.get("submit_thread_id")
+        if tid:
+            try:
+                scan_ch = client.get_channel(int(tid)) or await client.fetch_channel(int(tid))
+            except (discord.NotFound, discord.HTTPException, TypeError, ValueError):
+                scan_ch = None
+        if scan_ch is None:
+            if is_in_sa_channel(message.channel):
+                scan_ch = message.channel
+            else:
+                await message.reply(
+                    "No scores thread and this isn’t the SA channel. "
+                    "Run `!sa scan` in `#sa` or recreate the event.",
+                    mention_author=False,
+                )
+                return
+
+        await message.reply(
+            f"Scanning last **{limit}** messages in "
+            f"{getattr(scan_ch, 'mention', scan_ch)} for scores… "
+            f"(may take a bit if screenshots need OCR)",
+            mention_author=False,
+        )
+        try:
+            stats = await scan_channel_scores(scan_ch, limit=limit)
+        except Exception as e:
+            print(f"Scan failed: {e}")
+            await message.reply(f"Scan failed: `{e}`", mention_author=False)
+            return
+
+        state = load_state()
+        await update_board(state)
+        await message.reply(
+            f"**Scan done** (build `{BOT_VERSION}`)\n"
+            f"Looked at **{stats['looked']}** · score candidates **{stats['candidates']}**\n"
+            f"Logged **{stats['logged']}** (new PBs **{stats['improved']}**)\n"
+            f"Rejected **{stats['rejected']}** · unreadable **{stats['no_score']}** · "
+            f"skipped **{stats['skipped']}**\n"
+            f"Board refreshed.",
+            mention_author=False,
+        )
+        return
+
     # Clear channel / thread messages (operator)
     # !sa clear          → bot messages only (default, safer)
     # !sa clear bot 50
@@ -1921,8 +2171,195 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Score intake
+# Score intake + history scan
 # ---------------------------------------------------------------------------
+
+async def process_score_message(
+    message: discord.Message,
+    *,
+    quiet: bool = False,
+    force: bool = False,
+) -> dict:
+    """
+    Parse one message as a score and record it.
+    quiet=True: no text replies (for bulk scan); still reacts.
+    force=True: re-process even if already ✅ (scan re-read).
+    Returns status dict: ok/skipped/rejected/no_score + detail.
+    """
+    state = load_state()
+    if not state.get("active"):
+        return {"status": "inactive"}
+
+    if not force and (
+        bot_has_reaction(message, "✅")
+        or bot_has_reaction(message, "❌")
+        or bot_has_reaction(message, "❓")
+        or bot_has_reaction(message, "⚠️")
+    ):
+        return {"status": "skipped", "reason": "already processed"}
+
+    if not looks_like_score_candidate(message):
+        return {"status": "skipped", "reason": "not a score post"}
+
+    has_image = any(
+        ((a.content_type or "").startswith("image/")
+         or (a.filename or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")))
+        for a in _iter_message_attachments(message)
+    )
+    has_embed = bool(list(_iter_message_embeds(message))) or bool(message.reference)
+
+    if has_image and not has_embed and not gemini_client:
+        if not quiet:
+            try:
+                await message.add_reaction("⚠️")
+            except discord.HTTPException:
+                pass
+        return {"status": "skipped", "reason": "ocr disabled"}
+
+    if not quiet:
+        try:
+            await message.add_reaction("⏳")
+        except discord.HTTPException:
+            pass
+
+    data = await extract_score_data(message)
+    if not data or not data.get("score"):
+        if not quiet:
+            try:
+                await message.add_reaction("❓")
+            except discord.HTTPException:
+                pass
+        return {"status": "no_score"}
+
+    player = data.get("playerName") or "Unknown"
+    if player == "Unknown" or is_game_footer(player):
+        data["playerName"] = parse_player_name(
+            getattr(message.author, "global_name", None)
+            or message.author.display_name
+            or message.author.name
+        )
+        data["playerName"], ph = resolve_roster_player(
+            data["playerName"], data.get("playerHash")
+        )
+        if ph:
+            data["playerHash"] = ph
+
+    result = record_score(state, data, discord_user_id=message.author.id)
+
+    if result.get("rejected"):
+        if not quiet:
+            try:
+                await message.add_reaction("❌")
+                await message.reply(
+                    result.get("reason") or "Score rejected.",
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
+        else:
+            try:
+                await message.add_reaction("❌")
+            except discord.HTTPException:
+                pass
+        return {"status": "rejected", "reason": result.get("reason"), "result": result}
+
+    try:
+        # Clear prior reactions noise on rescan
+        if force:
+            try:
+                await message.clear_reaction("❌")
+                await message.clear_reaction("❓")
+                await message.clear_reaction("⚠️")
+                await message.clear_reaction("⏳")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+
+    if not quiet:
+        mode_label = game_mode_label(result["mode"])
+        diff_label = difficulty_label(result.get("difficulty") or "normal")
+        try:
+            if result.get("improved"):
+                prev = result.get("previous")
+                if prev is not None:
+                    text = (
+                        f"**{result['player']}** · {mode_label} · {diff_label}\n"
+                        f"`{prev:,}` → **`{result['score']:,}`** (new PB for this event)"
+                    )
+                else:
+                    text = (
+                        f"**{result['player']}** · {mode_label} · {diff_label}\n"
+                        f"**`{result['score']:,}`** logged"
+                    )
+            else:
+                text = (
+                    f"**{result['player']}** · {mode_label} · {diff_label}\n"
+                    f"`{result['score']:,}` submitted — best stays **`{result['best']:,}`**"
+                )
+            await message.reply(text, mention_author=False)
+        except discord.HTTPException as e:
+            print(f"Score reply failed: {e}")
+
+    return {
+        "status": "ok",
+        "improved": bool(result.get("improved")),
+        "result": result,
+    }
+
+
+async def scan_channel_scores(
+    channel: discord.abc.Messageable,
+    *,
+    limit: int = 100,
+) -> dict:
+    """
+    Walk recent channel history (oldest first within the window) and
+    count score embeds/screenshots toward the live event board.
+    """
+    limit = max(1, min(int(limit), 500))
+    stats = {
+        "looked": 0,
+        "candidates": 0,
+        "logged": 0,
+        "improved": 0,
+        "rejected": 0,
+        "no_score": 0,
+        "skipped": 0,
+    }
+    # Fetch newest-first, reverse for chronological PB order
+    batch: list[discord.Message] = []
+    async for msg in channel.history(limit=limit):
+        batch.append(msg)
+    batch.reverse()
+
+    for msg in batch:
+        stats["looked"] += 1
+        if msg.author.bot and client.user and msg.author.id == client.user.id:
+            stats["skipped"] += 1
+            continue
+        if not looks_like_score_candidate(msg):
+            stats["skipped"] += 1
+            continue
+        stats["candidates"] += 1
+        out = await process_score_message(msg, quiet=True, force=True)
+        st = out.get("status")
+        if st == "ok":
+            stats["logged"] += 1
+            if out.get("improved"):
+                stats["improved"] += 1
+        elif st == "rejected":
+            stats["rejected"] += 1
+        elif st == "no_score":
+            stats["no_score"] += 1
+        else:
+            stats["skipped"] += 1
+        # Light rate limit for Discord + OCR
+        await asyncio.sleep(0.35)
+
+    return stats
+
 
 async def handle_score_submission(message: discord.Message) -> None:
     state = load_state()
@@ -1946,105 +2383,21 @@ async def handle_score_submission(message: discord.Message) -> None:
             pass
         return
 
-    if (
-        bot_has_reaction(message, "✅")
-        or bot_has_reaction(message, "❌")
-        or bot_has_reaction(message, "❓")
-        or bot_has_reaction(message, "⚠️")
-    ):
-        return
-
-    # Screenshots need Gemini — react so the player knows why it's quiet
-    has_image = any(
-        ((a.content_type or "").startswith("image/")
-         or (a.filename or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")))
-        for a in _iter_message_attachments(message)
-    )
-    has_embed = bool(list(_iter_message_embeds(message))) or bool(message.reference)
-
-    if has_image and not has_embed and not gemini_client:
+    out = await process_score_message(message, quiet=False, force=False)
+    if out.get("status") == "ok" and out.get("improved"):
+        state = load_state()
+        await update_board(state)
+    elif out.get("status") == "no_score":
         try:
-            await message.add_reaction("⚠️")
-            await message.reply(
-                "Screenshot received, but OCR is not configured "
-                "(`GEMINI_API_KEY` missing on the bot host).\n"
-                "Forward the in-game **Discord → Submit Score** embed instead, "
-                "or ask an admin to set the Gemini key.",
-                mention_author=False,
-            )
-        except discord.HTTPException:
-            pass
-        return
-
-    # Show the bot is working (OCR can take a few seconds)
-    try:
-        await message.add_reaction("⏳")
-    except discord.HTTPException:
-        pass
-
-    data = await extract_score_data(message)
-    if not data or not data.get("score"):
-        try:
-            await message.add_reaction("❓")
             await message.reply(
                 "Could not read a score from that post.\n"
                 "• Full **scoreboard screenshot** (score + mode visible), or\n"
                 "• **Forward** the game Discord → Submit Score embed\n"
-                f"Event song filter: {song_line(state)}",
+                f"Event song filter: {song_line(load_state())}",
                 mention_author=False,
             )
         except discord.HTTPException:
             pass
-        return
-
-    player = data.get("playerName") or "Unknown"
-    if player == "Unknown" or is_game_footer(player):
-        data["playerName"] = parse_player_name(
-            getattr(message.author, "global_name", None)
-            or message.author.display_name
-            or message.author.name
-        )
-
-    result = record_score(state, data, discord_user_id=message.author.id)
-
-    if result.get("rejected"):
-        try:
-            await message.add_reaction("❌")
-            await message.reply(result.get("reason") or "Score rejected.", mention_author=False)
-        except discord.HTTPException:
-            pass
-        return
-
-    mode = result["mode"]
-    mode_label = game_mode_label(mode)
-    diff_label = difficulty_label(result.get("difficulty") or "normal")
-
-    try:
-        await message.add_reaction("✅")
-        if result.get("improved"):
-            prev = result.get("previous")
-            if prev is not None:
-                text = (
-                    f"**{result['player']}** · {mode_label} · {diff_label}\n"
-                    f"`{prev:,}` → **`{result['score']:,}`** (new PB for this event)"
-                )
-            else:
-                text = (
-                    f"**{result['player']}** · {mode_label} · {diff_label}\n"
-                    f"**`{result['score']:,}`** logged"
-                )
-        else:
-            text = (
-                f"**{result['player']}** · {mode_label} · {diff_label}\n"
-                f"`{result['score']:,}` submitted — best stays **`{result['best']:,}`**"
-            )
-        await message.reply(text, mention_author=False)
-    except discord.HTTPException as e:
-        print(f"Score reply failed: {e}")
-
-    if result.get("improved"):
-        state = load_state()
-        await update_board(state)
 
 
 # ---------------------------------------------------------------------------
@@ -2084,6 +2437,8 @@ async def on_ready():
         print("Screenshot OCR: ready")
     else:
         print("Screenshot OCR: disabled (set GEMINI_API_KEY to enable)")
+
+    load_players_roster()
 
     state = load_state()
     if state.get("active"):

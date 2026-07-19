@@ -112,6 +112,32 @@ Shows live / scheduled state and any put-up or take-down times.
 !sa board
 ```
 
+### Count past score posts (backfill)
+
+If people posted scores **before** the bot was watching, or the board was empty after a restart:
+
+```
+!sa scan
+!sa scan 200
+```
+
+- Walks the **scores thread** history (or the SA channel if no thread)
+- Re-reads embeds / screenshots and applies **personal bests** to the live board
+- Optional limit (default **100**, max **500**)
+- Quiet scan (✅ on messages, one summary reply)
+
+### Player roster (names + hashes)
+
+File next to the bot: **`players.txt`** (from `Sea1 NAMES.txt` style):
+
+```
+RedKnight56 (Kegen Brooks) - Kegen Brooks (3pWX8nv3)
+Lana - lara (cDPuArtg)
+```
+
+- Matches score-card hashes to Smash names so board rows stay stable
+- `!sa players` lists the loaded roster
+
 ### Clear the channel (or a thread)
 
 Run these **in the channel/thread** you want cleaned:
