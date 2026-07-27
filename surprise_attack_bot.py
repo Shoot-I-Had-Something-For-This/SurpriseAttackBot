@@ -55,7 +55,7 @@ from supabase_sync import (
 load_dotenv()
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-27-supabase-leaderboard-v1"
+BOT_VERSION = "2026-07-27-supabase-fake-push-v2"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -2178,11 +2178,32 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         state = load_state()
         await update_board(state)
 
+        # Push to website (Supabase) — same path as real score intake
+        if result.get("improved"):
+            try:
+                eid = state.get("event_id")
+                pkey = player_storage_key(
+                    result.get("player") or player,
+                    result.get("player_hash"),
+                )
+                row = ((state.get("scores") or {}).get(mode) or {}).get(pkey)
+                if eid and row:
+                    await supabase_upsert_event(state)
+                    ok = await supabase_upsert_score(eid, mode, pkey, row)
+                    if not ok:
+                        print(
+                            f"Supabase fake score push failed event={eid} "
+                            f"mode={mode} player={pkey}"
+                        )
+            except Exception as e:
+                print(f"Supabase fake score push error: {e}")
+
         if result.get("improved"):
             await message.reply(
                 f"Test score logged → **{game_mode_label(mode)}** · "
                 f"**{player}** · `{score:,}`\n"
-                "Check the live leaderboard message above.",
+                "Check the live leaderboard message above"
+                + (" + website." if supabase_enabled() else "."),
                 mention_author=False,
             )
         else:
