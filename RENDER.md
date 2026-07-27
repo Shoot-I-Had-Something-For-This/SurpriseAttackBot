@@ -74,9 +74,14 @@ Or use the included `render.yaml` (**New +** → **Blueprint** → select repo) 
 | `DISCORD_TOKEN` | Bot token | **Yes** |
 | `SA_CHANNEL_ID` | Channel ID for `#sa` | **Yes** |
 | `GEMINI_API_KEY` | Google AI key for screenshots | Recommended |
+| `SUPABASE_URL` | `https://xxxx.supabase.co` (SA project) | For website leaderboard |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase **service_role** secret | For website leaderboard |
 | `SA_OPERATOR_ROLE_IDS` | Comma-separated role IDs | Optional |
 | `SA_LEADERBOARD_LIMIT` | `10` | Optional |
 | `PYTHON_VERSION` | `3.12.8` | Optional (Blueprint sets this) |
+
+Website (Vercel): https://surprise-attack-leaderboard.vercel.app  
+Use the **service_role** key on Render only — never put it in Vercel.
 
 **Do not** paste your local `.env` file into the repo. Only set secrets in Render’s UI.
 
