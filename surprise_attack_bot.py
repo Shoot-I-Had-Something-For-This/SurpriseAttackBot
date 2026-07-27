@@ -44,10 +44,18 @@ import discord
 from aiohttp import web
 from dotenv import load_dotenv
 
+from supabase_sync import (
+    close_event as supabase_close_event,
+    supabase_enabled,
+    sync_all_scores as supabase_sync_all_scores,
+    upsert_event as supabase_upsert_event,
+    upsert_score as supabase_upsert_score,
+)
+
 load_dotenv()
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-19-scan-roster-v1"
+BOT_VERSION = "2026-07-27-supabase-leaderboard-v1"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -1433,16 +1441,20 @@ async def begin_live_event(
     duration_sec → auto take-down after that many seconds.
     difficulty → optional lock (easy/normal/hard/extreme/hardcore); None = any.
     """
+    old = load_state()
     state = empty_state()
     # Keep board message id if we're promoting a pre-announce in same channel
     if preserve_board:
-        old = load_state()
         state["board_message_id"] = old.get("board_message_id")
         state["channel_id"] = old.get("channel_id")
 
     now = int(time.time())
     state["active"] = True
-    state["event_id"] = new_event_id()
+    # Reuse scheduled event_id so Supabase/website keep one continuous row
+    if old.get("event_id") and not old.get("active") and old.get("scheduled_start_at"):
+        state["event_id"] = old["event_id"]
+    else:
+        state["event_id"] = new_event_id()
     state["song_title"] = title
     state["song_artist"] = artist
     if difficulty and is_known_difficulty(difficulty):
@@ -1480,6 +1492,12 @@ async def begin_live_event(
 
         await update_board(state, force_new=not preserve_board)
 
+    # Push event shell to Supabase so the website shows LIVE immediately
+    try:
+        await supabase_upsert_event(load_state())
+    except Exception as e:
+        print(f"Supabase upsert_event (start) failed: {e}")
+
     state = load_state()
     state["_thread_id"] = thread.id if thread else None
     return state
@@ -1500,6 +1518,12 @@ async def finish_live_event(*, auto: bool = False) -> dict:
     save_state(state)
     await update_board(state)
     await close_submit_thread(state)
+
+    # Final leaderboard snapshot → Supabase (Vercel site)
+    try:
+        await supabase_close_event(load_state())
+    except Exception as e:
+        print(f"Supabase close_event failed: {e}")
 
     lines = [
         f"**Surprise Attack ended** `{state.get('event_id')}`"
@@ -1804,6 +1828,7 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             go_live_at = now + int(start_in)
             state = empty_state()
             state["active"] = False
+            state["event_id"] = new_event_id()
             state["song_title"] = title
             state["song_artist"] = artist
             state["event_difficulty"] = event_diff
@@ -1821,6 +1846,10 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
                 f"duration={duration} song={title!r} diff={event_diff!r}"
             )
             await post_scheduled_notice(state)
+            try:
+                await supabase_upsert_event(state)
+            except Exception as e:
+                print(f"Supabase upsert_event (schedule) failed: {e}")
 
             reply = (
                 f"📅 **Put-up scheduled** in {format_duration(start_in)}\n"
@@ -2302,6 +2331,22 @@ async def process_score_message(
         except discord.HTTPException as e:
             print(f"Score reply failed: {e}")
 
+    # Website leaderboard (Supabase) — only on PB improve
+    if result.get("improved"):
+        try:
+            st = load_state()
+            eid = st.get("event_id")
+            mode = result.get("mode") or "classic"
+            pkey = player_storage_key(
+                result.get("player") or "Unknown",
+                result.get("player_hash"),
+            )
+            row = ((st.get("scores") or {}).get(mode) or {}).get(pkey)
+            if eid and row:
+                await supabase_upsert_score(eid, mode, pkey, row)
+        except Exception as e:
+            print(f"Supabase upsert_score failed: {e}")
+
     return {
         "status": "ok",
         "improved": bool(result.get("improved")),
@@ -2438,6 +2483,14 @@ async def on_ready():
     else:
         print("Screenshot OCR: disabled (set GEMINI_API_KEY to enable)")
 
+    if supabase_enabled():
+        print("Supabase leaderboard sync: ready")
+    else:
+        print(
+            "Supabase leaderboard sync: disabled "
+            "(set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)"
+        )
+
     load_players_roster()
 
     state = load_state()
@@ -2446,11 +2499,15 @@ async def on_ready():
         if state.get("scheduled_end_at"):
             print(f"  take-down scheduled at unix {state['scheduled_end_at']}")
         asyncio.create_task(update_board(state))
+        if supabase_enabled():
+            asyncio.create_task(supabase_sync_all_scores(state))
     elif state.get("scheduled_start_at"):
         print(
             f"Pending put-up at unix {state['scheduled_start_at']} "
             f"song={state.get('song_title')!r}"
         )
+        if supabase_enabled() and state.get("event_id"):
+            asyncio.create_task(supabase_upsert_event(state))
 
     # Background put-up / take-down timers (survives redeploys via sa_state.json)
     global _scheduler_started
