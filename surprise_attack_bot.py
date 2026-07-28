@@ -57,7 +57,7 @@ from supabase_sync import (  # noqa: E402
 )
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-27-website-env-runtime-v4"
+BOT_VERSION = "2026-07-27-website-status-v5"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -1814,6 +1814,8 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         lines = [
             f"**Server:** {guild_name}",
             f"**Watching channel ID:** `{SA_CHANNEL_ID}`",
+            f"**Build:** `{BOT_VERSION}`",
+            f"**Website sync:** `{supabase_config_detail()}`",
         ]
         if state.get("active"):
             lines.extend(
@@ -1828,6 +1830,7 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             if state.get("started_at"):
                 lines.append(f"Started: <t:{int(state['started_at'])}:R>")
             lines.extend(timer_lines(state))
+            lines.append("_Operators: `!sa web` force-pushes this live event to the site._")
         elif state.get("scheduled_start_at"):
             lines.append("**SCHEDULED** (not live yet)")
             lines.append(f"Song: {song_line(state)}")
