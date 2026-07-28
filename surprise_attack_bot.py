@@ -57,7 +57,7 @@ from supabase_sync import (  # noqa: E402
 )
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-28-website-force-v6"
+BOT_VERSION = "2026-07-28-render-website-v7"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -1710,9 +1710,23 @@ async def scheduler_tick() -> None:
 async def scheduler_loop() -> None:
     await client.wait_until_ready()
     print("Schedule timer loop running (check every 15s)")
+    _web_tick = 0
     while not client.is_closed():
         try:
             await scheduler_tick()
+            # Keep website in sync while live/scheduled (covers missed pushes).
+            _web_tick += 1
+            if _web_tick % 2 == 0:  # every ~30s
+                st = load_state()
+                if st.get("active"):
+                    st, _ = ensure_live_identity(st, save=True)
+                    ok, detail = await publish_scores_to_website(st)
+                    if not ok:
+                        print(f"Periodic website sync FAILED: {detail}")
+                elif st.get("scheduled_start_at") and st.get("event_id"):
+                    ok, detail = await publish_event_to_website(st)
+                    if not ok:
+                        print(f"Periodic schedule website sync FAILED: {detail}")
         except Exception as e:
             print(f"Scheduler tick error: {e}")
         await asyncio.sleep(15)
