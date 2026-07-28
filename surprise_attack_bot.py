@@ -57,7 +57,7 @@ from supabase_sync import (  # noqa: E402
 )
 
 # Bump this on every deploy-critical fix so !sa help / /health prove which build is live.
-BOT_VERSION = "2026-07-28-run-fix-v8"
+BOT_VERSION = "2026-07-28-website-v8"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -2210,13 +2210,16 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
 
         state = load_state()
         await update_board(state)
+        # Full board → website after backfill (covers scores scan improved one-by-one)
+        web_ok, web_detail = await publish_scores_to_website(state)
         await message.reply(
             f"**Scan done** (build `{BOT_VERSION}`)\n"
             f"Looked at **{stats['looked']}** · score candidates **{stats['candidates']}**\n"
             f"Logged **{stats['logged']}** (new PBs **{stats['improved']}**)\n"
             f"Rejected **{stats['rejected']}** · unreadable **{stats['no_score']}** · "
             f"skipped **{stats['skipped']}**\n"
-            f"Board refreshed.",
+            f"Board refreshed.\n"
+            f"{website_status_line(web_ok, web_detail)}",
             mention_author=False,
         )
         return
@@ -2516,30 +2519,17 @@ async def process_score_message(
         except discord.HTTPException as e:
             print(f"Score reply failed: {e}")
 
-    # Website leaderboard (Supabase) — only on PB improve
-    if result.get("improved"):
+    # Website leaderboard (Supabase) — only on PB improve.
+    # Full-board upsert so the Vercel site never drifts if one earlier write failed.
+    # Skip during quiet scans (bulk); !sa scan pushes once at the end.
+    if result.get("improved") and not quiet:
         try:
             st = load_state()
-            st, _ = ensure_live_identity(st, save=True)
-            eid = st.get("event_id")
-            mode = result.get("mode") or "classic"
-            pkey = player_storage_key(
-                result.get("player") or "Unknown",
-                result.get("player_hash"),
-            )
-            row = ((st.get("scores") or {}).get(mode) or {}).get(pkey)
-            if eid and row:
-                e_ok, e_detail = await supabase_upsert_event(st)
-                if not e_ok:
-                    print(f"Supabase upsert_event (score path) FAILED: {e_detail}")
-                else:
-                    s_ok, s_detail = await supabase_upsert_score(eid, mode, pkey, row)
-                    if not s_ok:
-                        print(f"Supabase upsert_score FAILED: {s_detail}")
+            ok, detail = await publish_scores_to_website(st)
+            if not ok:
+                print(f"Supabase score-path full sync FAILED: {detail}")
             else:
-                print(
-                    f"Supabase skip score: eid={eid!r} row_present={bool(row)}"
-                )
+                print(f"Supabase score-path full sync OK: {detail}")
         except Exception as e:
             print(f"Supabase upsert_score failed: {e}")
 

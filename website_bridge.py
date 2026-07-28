@@ -7,8 +7,9 @@ does NOT fight the bot token connection.
 
 Every few seconds:
   1. Read the SA channel
-  2. Find the live/scheduled leaderboard message the bot posts
-  3. Upsert event + scores into Supabase for the Vercel site
+  2. Find ALL leaderboard messages the bot posts
+  3. Prefer a true LIVE board (never an older zombie or empty CLOSED shell)
+  4. Upsert every unique event + its scores into Supabase for the Vercel site
 
 Env (same .env as the bot):
   DISCORD_TOKEN
@@ -56,13 +57,14 @@ MODES = ("arcade", "classic", "fusion")
 
 # 🥇 **Name** — `1,234,567` · Hardcore
 SCORE_LINE = re.compile(
-    r"\*\*(.+?)\*\*\s*[—-]\s*`([0-9,]+)`",
+    r"\*\*(.+?)\*\*\s*[—–-]\s*`([0-9,]+)`",
     re.UNICODE,
 )
 EVENT_ID_RE = re.compile(r"\*\*Event:\*\*\s*`([^`]+)`")
 SONG_RE = re.compile(r"\*\*Song:\*\*\s*(.+)")
 STATUS_RE = re.compile(r"\*\*Status:\*\*\s*(\w+)", re.I)
 DIFF_RE = re.compile(r"\*\*Difficulty:\*\*\s*(.+)")
+ROW_DIFF_RE = re.compile(r"·\s*([A-Za-z]+)\s*$")
 
 
 def _log(msg: str) -> None:
@@ -74,7 +76,7 @@ def discord_get(path: str):
         f"https://discord.com/api/v10{path}",
         headers={
             "Authorization": f"Bot {TOKEN}",
-            "User-Agent": "SA-WebsiteBridge/1.0",
+            "User-Agent": "SA-WebsiteBridge/1.1",
         },
     )
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -113,12 +115,10 @@ def parse_song(song_field: str) -> tuple[str | None, str | None]:
     raw = strip_md(song_field)
     if not raw or raw.lower().startswith("any song"):
         return None, None
-    if " — " in raw:
-        a, b = raw.split(" — ", 1)
-        return a.strip() or None, b.strip() or None
-    if " - " in raw:
-        a, b = raw.split(" - ", 1)
-        return a.strip() or None, b.strip() or None
+    for sep in (" — ", " – ", " - "):
+        if sep in raw:
+            a, b = raw.split(sep, 1)
+            return a.strip() or None, b.strip() or None
     return raw or None, None
 
 
@@ -181,6 +181,12 @@ def parse_board_message(msg: dict) -> dict | None:
             player = sm.group(1).strip()
             score = int(sm.group(2).replace(",", ""))
             player_key = re.sub(r"\s+", " ", player.lower()).strip() or "unknown"
+            row_diff = event_diff
+            dm = ROW_DIFF_RE.search(line)
+            if dm:
+                cand = dm.group(1).lower()
+                if cand in ("easy", "normal", "hard", "extreme", "hardcore"):
+                    row_diff = cand
             scores.append(
                 {
                     "event_id": event_id,
@@ -189,7 +195,7 @@ def parse_board_message(msg: dict) -> dict | None:
                     "player_name": player,
                     "player_hash": None,
                     "score": score,
-                    "difficulty": event_diff,
+                    "difficulty": row_diff,
                     "title": song_title,
                     "artist": song_artist,
                     "discord_user_id": None,
@@ -207,34 +213,108 @@ def parse_board_message(msg: dict) -> dict | None:
         "event_difficulty": event_diff,
         "scores": scores,
         "msg_id": msg.get("id"),
+        "msg_id_int": int(msg.get("id") or 0),
     }
 
 
-def find_latest_board(messages: list[dict]) -> dict | None:
+def parse_all_boards(messages: list[dict]) -> list[dict]:
+    boards: list[dict] = []
     for msg in messages:
         parsed = parse_board_message(msg)
         if parsed:
-            return parsed
-    return None
+            boards.append(parsed)
+    boards.sort(key=lambda b: b["msg_id_int"], reverse=True)
+    return boards
+
+
+def normalize_zombie_lives(boards: list[dict]) -> list[dict]:
+    """
+    Only the newest board message may stay LIVE/SCHEDULED.
+    Older LIVE embeds left behind by bot crashes are treated as closed so the
+    website never shows a stale attack as current.
+    """
+    if not boards:
+        return boards
+    newest = boards[0]["msg_id_int"]
+    out: list[dict] = []
+    for b in boards:
+        b = dict(b)
+        if b["msg_id_int"] < newest and b["status"] in ("live", "scheduled"):
+            b["status"] = "closed"
+        out.append(b)
+    return out
+
+
+def dedupe_by_event(boards: list[dict]) -> list[dict]:
+    """One row per event_id — prefer more scores, then newer message."""
+    best: dict[str, dict] = {}
+    for b in boards:
+        eid = b["event_id"]
+        prev = best.get(eid)
+        if not prev:
+            best[eid] = b
+            continue
+        n_new = len(b.get("scores") or [])
+        n_old = len(prev.get("scores") or [])
+        if n_new > n_old:
+            best[eid] = b
+        elif n_new < n_old:
+            continue
+        elif b["msg_id_int"] >= prev["msg_id_int"]:
+            # Prefer live/scheduled status from the newer message when scores tie
+            best[eid] = b
+    return list(best.values())
+
+
+def pick_primary(boards: list[dict]) -> dict | None:
+    """What the site should treat as 'current' (for log line only)."""
+    if not boards:
+        return None
+    for b in boards:
+        if b["status"] == "live":
+            return b
+    for b in boards:
+        if b["status"] == "scheduled":
+            return b
+    # Prefer closed board that actually has scores over empty shells
+    with_scores = [b for b in boards if b.get("scores")]
+    if with_scores:
+        return max(with_scores, key=lambda b: b["msg_id_int"])
+    return boards[0]
+
+
+def started_at_from_event_id(event_id: str | None) -> str | None:
+    if not event_id:
+        return None
+    m = re.match(r"sa-(\d{8})-(\d{6})$", str(event_id).strip())
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+        return dt.isoformat()
+    except ValueError:
+        return None
 
 
 def upsert_event(parsed: dict) -> tuple[bool, str]:
     now = datetime.now(timezone.utc).isoformat()
+    started = started_at_from_event_id(parsed.get("event_id")) or now
     row = {
         "event_id": parsed["event_id"],
         "song_title": parsed.get("song_title"),
         "song_artist": parsed.get("song_artist"),
         "event_difficulty": parsed.get("event_difficulty"),
         "status": parsed["status"],
-        "started_at": now if parsed["status"] == "live" else None,
-        "ended_at": now if parsed["status"] == "closed" else None,
+        "started_at": started,
         "updated_at": now,
     }
-    # Don't clobber started_at with null on later polls for live events —
-    # only set started_at on first live; use merge carefully.
+    # Keep timestamps honest; never null out started_at on later polls.
     if parsed["status"] == "live":
-        row.pop("ended_at", None)
-        # Keep started_at only if we want update — better omit ended_at
+        row["ended_at"] = None
+    elif parsed["status"] == "closed":
+        row["ended_at"] = now
     st, body = supabase_request(
         "POST",
         "sa_events",
@@ -266,19 +346,46 @@ def upsert_scores(scores: list[dict]) -> tuple[int, str]:
 
 def sync_once() -> str:
     # Board can sit further back if the channel is chatty — pull enough history.
-    msgs = discord_get(f"/channels/{CHANNEL_ID}/messages?limit=50")
-    parsed = find_latest_board(msgs)
-    if not parsed:
-        return "no board message in last 50 channel msgs"
-    e_ok, e_detail = upsert_event(parsed)
-    if not e_ok:
-        return f"EVENT FAIL {e_detail}"
-    n, s_detail = upsert_scores(parsed.get("scores") or [])
-    return (
-        f"OK {e_detail} · {n} score(s) · song={parsed.get('song_title')!r} "
-        f"· msg={parsed.get('msg_id')}"
-        + (f" · score_err={s_detail}" if n == 0 and s_detail != "ok" and parsed.get("scores") else "")
+    msgs = discord_get(f"/channels/{CHANNEL_ID}/messages?limit=100")
+    boards = normalize_zombie_lives(parse_all_boards(msgs))
+    if not boards:
+        return "no board message in last 100 channel msgs"
+
+    unique = dedupe_by_event(boards)
+    primary = pick_primary(unique)
+
+    total_scores = 0
+    event_bits: list[str] = []
+    errors: list[str] = []
+
+    # Upsert oldest → newest so the final write of overlapping fields is newest
+    for parsed in sorted(unique, key=lambda b: b["msg_id_int"]):
+        e_ok, e_detail = upsert_event(parsed)
+        if not e_ok:
+            errors.append(f"EVENT FAIL {e_detail}")
+            continue
+        n, s_detail = upsert_scores(parsed.get("scores") or [])
+        total_scores += n
+        event_bits.append(
+            f"{parsed['event_id']}[{parsed['status']}/{n}sc]"
+        )
+        if n == 0 and s_detail != "ok" and parsed.get("scores"):
+            errors.append(f"score_err {parsed['event_id']}: {s_detail}")
+
+    primary_bit = ""
+    if primary:
+        primary_bit = (
+            f" primary={primary['event_id']} song={primary.get('song_title')!r}"
+        )
+
+    msg = (
+        f"OK {len(unique)} event(s) · {total_scores} score row(s) · "
+        + ", ".join(event_bits)
+        + primary_bit
     )
+    if errors:
+        msg += " · " + "; ".join(errors[:2])
+    return msg
 
 
 def main() -> int:

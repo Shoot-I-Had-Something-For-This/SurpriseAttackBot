@@ -18,3 +18,4 @@ services:
       # SUPABASE_SERVICE_ROLE_KEY
       # GEMINI_API_KEY (optional, screenshots)
       # SA_OPERATOR_ROLE_IDS (optional)
+      # SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (Vercel leaderboard site)

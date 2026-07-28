@@ -99,7 +99,9 @@ Test server channel IDs are **not** production. Always re-point `.env`.
 
 ## Notes
 
-- Scores are stored **locally** on the bot host (`sa_state.json` + `history/`). No Indies-DB / Supabase required.  
+- Scores are stored **locally** on the bot host (`sa_state.json` + `history/`). Discord still works with no cloud DB.  
+- **Optional website:** set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` on the bot host → live events and scores also push to Supabase for the Vercel leaderboard. See **[WEBSITE.md](WEBSITE.md)**.  
 - Fusion is supported as a third mode. If the game embed says something unexpected, the bot defaults to Classic and logs it.  
 - Song filter is best-effort title matching when you pass a song to `!sa start`.
 - Difficulty lock is optional: `on easy|normal|hard|extreme|hardcore` (also `difficulty …`, `diff …`, `@ …`). Omit = any difficulty.
+- Operators: `!sa web` force-pushes the current event/board to the site; `!sa status` shows website sync ON/OFF.
