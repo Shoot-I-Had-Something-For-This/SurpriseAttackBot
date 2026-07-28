@@ -21,29 +21,50 @@ from typing import Any
 
 import aiohttp
 
-SUPABASE_URL = (
-    os.getenv("SUPABASE_URL")
-    or os.getenv("SA_SUPABASE_URL")
-    or ""
-).strip().rstrip("/")
-
-SUPABASE_SERVICE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    or os.getenv("SA_SUPABASE_SERVICE_KEY")
-    or ""
-).strip()
-
 MODES = ("arcade", "classic", "fusion")
 
 
+def _supabase_url() -> str:
+    """Read at call time so load_dotenv() / Render env always win."""
+    return (
+        os.getenv("SUPABASE_URL")
+        or os.getenv("SA_SUPABASE_URL")
+        or ""
+    ).strip().rstrip("/")
+
+
+def _supabase_service_key() -> str:
+    return (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SA_SUPABASE_SERVICE_KEY")
+        or ""
+    ).strip()
+
+
 def supabase_enabled() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+    return bool(_supabase_url() and _supabase_service_key())
+
+
+def supabase_config_detail() -> str:
+    """Human-readable config status (never includes secrets)."""
+    url = _supabase_url()
+    key = _supabase_service_key()
+    if url and key:
+        host = url.replace("https://", "").replace("http://", "").split("/")[0]
+        return f"ON · {host} · key set ({len(key)} chars)"
+    missing = []
+    if not url:
+        missing.append("SUPABASE_URL")
+    if not key:
+        missing.append("SUPABASE_SERVICE_ROLE_KEY")
+    return "OFF · missing " + ", ".join(missing)
 
 
 def _headers() -> dict[str, str]:
+    key = _supabase_service_key()
     return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
@@ -118,7 +139,8 @@ async def _request(
 ) -> tuple[bool, str]:
     if not supabase_enabled():
         return False, "Supabase env missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)"
-    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
+    base = _supabase_url()
+    url = f"{base}/rest/v1/{path.lstrip('/')}"
     try:
         timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(timeout=timeout) as session:

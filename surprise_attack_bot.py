@@ -44,18 +44,20 @@ import discord
 from aiohttp import web
 from dotenv import load_dotenv
 
-from supabase_sync import (
+# Load .env BEFORE importing supabase_sync helpers that read env.
+load_dotenv()
+
+from supabase_sync import (  # noqa: E402
     close_event as supabase_close_event,
+    supabase_config_detail,
     supabase_enabled,
     sync_all_scores as supabase_sync_all_scores,
     upsert_event as supabase_upsert_event,
     upsert_score as supabase_upsert_score,
 )
 
-load_dotenv()
-
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-27-website-honest-sync-v3"
+BOT_VERSION = "2026-07-27-website-env-runtime-v4"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -1770,6 +1772,7 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             f"!sa scan [limit]              re-read past score posts (default 100)\n"
             f"!sa players                   show name/hash roster\n"
             f"!sa fake <mode> <score> [name]\n"
+            f"!sa web                       force-push live event to website\n"
             f"!sa clear [bot|all] [limit]\n"
             f"!sa help / !sa version        this message\n"
             f"```\n"
@@ -1844,6 +1847,45 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
     if not is_operator(message.author):
         await message.reply(
             "Only **SA Operators** (or Manage Server) can run that command.",
+            mention_author=False,
+        )
+        return
+
+    if action in ("web", "website", "sync", "push"):
+        # Force re-push current event + scores so we can diagnose without Render logs.
+        cfg = supabase_config_detail()
+        state = load_state()
+        if not state.get("active") and not state.get("scheduled_start_at"):
+            await message.reply(
+                f"**Website sync config:** `{cfg}`\n"
+                f"**Bot build:** `{BOT_VERSION}`\n"
+                "No live or scheduled event in bot memory — nothing to push.\n"
+                "Start one with `!sa start Song - Artist`, then the site updates "
+                "(or run `!sa web` again while live).",
+                mention_author=False,
+            )
+            return
+        if state.get("active"):
+            state, healed = ensure_live_identity(state, save=True)
+            ok, detail = await publish_scores_to_website(state)
+            heal_note = " · healed missing event_id/start" if healed else ""
+            await message.reply(
+                f"**Website force-push** (live event){heal_note}\n"
+                f"Config: `{cfg}`\n"
+                f"Event: `{state.get('event_id')}` · {song_line(state)}\n"
+                f"{website_status_line(ok, detail)}\n"
+                f"_Site:_ https://surprise-attack-leaderboard.vercel.app",
+                mention_author=False,
+            )
+            return
+        # scheduled only
+        ok, detail = await publish_event_to_website(state)
+        await message.reply(
+            f"**Website force-push** (scheduled event)\n"
+            f"Config: `{cfg}`\n"
+            f"Event: `{state.get('event_id')}` · {song_line(state)}\n"
+            f"{website_status_line(ok, detail)}\n"
+            f"_Site:_ https://surprise-attack-leaderboard.vercel.app",
             mention_author=False,
         )
         return
@@ -2588,12 +2630,11 @@ async def on_ready():
     else:
         print("Screenshot OCR: disabled (set GEMINI_API_KEY to enable)")
 
-    if supabase_enabled():
-        print("Supabase leaderboard sync: ready")
-    else:
+    print(f"Supabase leaderboard sync: {supabase_config_detail()}")
+    if not supabase_enabled():
         print(
-            "Supabase leaderboard sync: disabled "
-            "(set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)"
+            "  → Website will stay empty until SUPABASE_URL + "
+            "SUPABASE_SERVICE_ROLE_KEY are set on this host (Render env)."
         )
 
     load_players_roster()
