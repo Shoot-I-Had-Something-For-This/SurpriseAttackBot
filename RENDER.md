@@ -110,10 +110,20 @@ Screenshot OCR: ready
 
 ### Prove the live build (Lesnar / operators)
 
-**Git is not the usual problem anymore.** As of 2026-07-17, both of these remotes serve the same `main` tip (`3948252`, `BOT_VERSION=2026-07-17-difficulty-v1`):
+**Canonical GitHub repo (use this in Render — do not use the old user redirect):**
 
-- `https://github.com/JStillxSKS/SurpriseAttackBot` (redirect / old URL)
-- `https://github.com/Shoot-I-Had-Something-For-This/SurpriseAttackBot` (canonical)
+- `https://github.com/Shoot-I-Had-Something-For-This/SurpriseAttackBot` ← **only this**
+- Old `JStillxSKS/SurpriseAttackBot` only redirects. After the repo **moved/retargeted** to the org, Render often keeps an old link and **never picks up new commits** (health stays plain `ok`, Discord stays on old build).
+
+### If Render “retargets” / won’t take new code after the repo move
+
+1. GitHub → open [Render GitHub App](https://github.com/apps/render/installations/new) → configure installation for org **`Shoot-I-Had-Something-For-This`** → **Repository access** must include **`SurpriseAttackBot`**.
+2. Render → **SurpriseAttackBot** service → **Settings → Build & Deploy → Repo**
+   - Repo: **`Shoot-I-Had-Something-For-This/SurpriseAttackBot`** (not `JStillxSKS/...`)
+   - Branch: **`main`**
+   - Auto-Deploy: **Yes**
+3. **Manual Deploy → Clear build cache & deploy**
+4. Proof: https://surpriseattackbot.onrender.com/health must contain `render-website-v7` (or newer), not bare `ok`.
 
 If Discord still looks wrong, **Render is not running that commit** (or env points at the wrong channel).
 
