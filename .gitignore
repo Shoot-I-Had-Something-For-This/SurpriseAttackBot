@@ -7,3 +7,7 @@ sa_state.json
 history/
 .idea/
 .vscode/
+
+_run_test_*.log
+bot_*.log
+

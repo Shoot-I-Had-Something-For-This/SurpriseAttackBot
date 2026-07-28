@@ -56,35 +56,54 @@ from supabase_sync import (  # noqa: E402
     upsert_score as supabase_upsert_score,
 )
 
-# Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-28-render-website-v7"
+# Bump this on every deploy-critical fix so !sa help / /health prove which build is live.
+BOT_VERSION = "2026-07-28-run-fix-v8"
 
 BOT_DIR = Path(__file__).resolve().parent
 
+
+def _clean_env(value: str | None) -> str:
+    """Strip whitespace and accidental quotes from Render/dashboard pastes."""
+    if not value:
+        return ""
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
+
+
 # === CONFIG ===
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or "YOUR_BOT_TOKEN_HERE"
+DISCORD_TOKEN = _clean_env(os.getenv("DISCORD_TOKEN")) or "YOUR_BOT_TOKEN_HERE"
 
 # Player roster: Discord aliases + Smash display name + short hash (from score cards)
-PLAYERS_PATH = Path(os.getenv("SA_PLAYERS_PATH") or BOT_DIR / "players.txt")
+PLAYERS_PATH = Path(_clean_env(os.getenv("SA_PLAYERS_PATH")) or BOT_DIR / "players.txt")
 
-_channel_raw = os.getenv("SA_CHANNEL_ID", "").strip()
-SA_CHANNEL_ID = int(_channel_raw) if _channel_raw else None
+_channel_raw = _clean_env(os.getenv("SA_CHANNEL_ID"))
+try:
+    SA_CHANNEL_ID = int(_channel_raw) if _channel_raw else None
+except ValueError:
+    print(f"ERROR: SA_CHANNEL_ID is not a number: {_channel_raw!r}")
+    SA_CHANNEL_ID = None
 
 # Comma-separated role IDs that may run !sa commands (optional if they have Manage Server)
-_role_raw = os.getenv("SA_OPERATOR_ROLE_IDS", "").strip()
+_role_raw = _clean_env(os.getenv("SA_OPERATOR_ROLE_IDS"))
 SA_OPERATOR_ROLE_IDS: set[int] = set()
 if _role_raw:
     for part in _role_raw.split(","):
-        part = part.strip()
+        part = part.strip().strip('"').strip("'")
         if part.isdigit():
             SA_OPERATOR_ROLE_IDS.add(int(part))
 
-LEADERBOARD_LIMIT = int(os.getenv("SA_LEADERBOARD_LIMIT", "10"))
-STATE_PATH = Path(os.getenv("SA_STATE_PATH") or BOT_DIR / "sa_state.json")
-HISTORY_DIR = Path(os.getenv("SA_HISTORY_DIR") or BOT_DIR / "history")
+try:
+    LEADERBOARD_LIMIT = int(_clean_env(os.getenv("SA_LEADERBOARD_LIMIT")) or "10")
+except ValueError:
+    LEADERBOARD_LIMIT = 10
+
+STATE_PATH = Path(_clean_env(os.getenv("SA_STATE_PATH")) or BOT_DIR / "sa_state.json")
+HISTORY_DIR = Path(_clean_env(os.getenv("SA_HISTORY_DIR")) or BOT_DIR / "history")
 
 # Gemini OCR for scoreboard screenshots (same idea as the Indies score bot)
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_API_KEY = _clean_env(os.getenv("GEMINI_API_KEY"))
 gemini_client = None
 if GEMINI_API_KEY:
     try:
@@ -2747,18 +2766,30 @@ async def on_message(message: discord.Message):
 async def health_check(_request: web.Request) -> web.Response:
     """
     Render health probe — free-tier web services need a listening $PORT.
-    Body includes build + supabase so we can prove which process is live
-    without Render dashboard access: GET /health
+    Always include BOT_VERSION so a deploy is visible without Logs:
+      GET /health  →  ok | version | supabase=... | discord=...
     """
     detail = supabase_config_detail()
-    # Keep it one line; Render only needs HTTP 200.
-    return web.Response(text=f"ok {BOT_VERSION} supabase={detail}")
+    ready = bool(client.user) and client.is_ready()
+    who = str(client.user) if client.user else "starting"
+    text = (
+        f"ok | {BOT_VERSION} | supabase={detail} | "
+        f"discord={'ready' if ready else 'starting'}:{who} | "
+        f"channel={SA_CHANNEL_ID}"
+    )
+    return web.Response(text=text, content_type="text/plain")
 
 
 async def start_health_server() -> web.AppRunner | None:
     """Listen on $PORT when deployed (Render sets this automatically)."""
-    port_raw = (os.getenv("PORT") or "").strip()
+    port_raw = _clean_env(os.getenv("PORT"))
     if not port_raw:
+        print("PORT not set — health server skipped (local/dev mode)")
+        return None
+    try:
+        port = int(port_raw)
+    except ValueError:
+        print(f"ERROR: PORT is not a number: {port_raw!r}")
         return None
 
     app = web.Application()
@@ -2766,10 +2797,10 @@ async def start_health_server() -> web.AppRunner | None:
     app.router.add_get("/health", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(port_raw))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Health check server listening on 0.0.0.0:{port_raw}")
-    print(f"Health body will report: ok {BOT_VERSION} supabase={supabase_config_detail()}")
+    print(f"Health check server listening on 0.0.0.0:{port}")
+    print(f"Health body will report: ok | {BOT_VERSION} | supabase={supabase_config_detail()}")
     return runner
 
 
@@ -2778,25 +2809,37 @@ async def run_bot() -> None:
     try:
         async with client:
             await client.start(DISCORD_TOKEN)
+    except discord.LoginFailure:
+        print("ERROR: Discord login failed — check DISCORD_TOKEN on this host")
+        raise
+    except Exception as e:
+        print(f"ERROR: bot crashed: {type(e).__name__}: {e}")
+        raise
     finally:
         if health_runner is not None:
             await health_runner.cleanup()
 
 
 def main() -> None:
-    if DISCORD_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("ERROR: Set DISCORD_TOKEN in .env")
+    print(f"Starting Surprise Attack bot build {BOT_VERSION}", flush=True)
+    if DISCORD_TOKEN == "YOUR_BOT_TOKEN_HERE" or not DISCORD_TOKEN:
+        print("ERROR: Set DISCORD_TOKEN in .env / Render Environment")
         sys.exit(1)
     if not SA_CHANNEL_ID:
-        print("ERROR: Set SA_CHANNEL_ID in .env")
+        print("ERROR: Set SA_CHANNEL_ID in .env / Render Environment")
         print("Discord → Settings → Advanced → Developer Mode ON")
         print("Right-click the channel → Copy Channel ID")
         sys.exit(1)
+    print(f"Config: channel={SA_CHANNEL_ID} supabase={supabase_config_detail()}", flush=True)
 
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
-        pass
+        print("Shutting down (KeyboardInterrupt)")
+    except Exception as e:
+        # Ensure Render logs show the real failure reason
+        print(f"FATAL: {type(e).__name__}: {e}", flush=True)
+        raise
 
 
 if __name__ == "__main__":

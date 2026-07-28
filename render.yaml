@@ -11,8 +11,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"
-      # Set these in the Render dashboard (secrets), not in git:
+      # Set these secrets in the Render dashboard (do not commit values):
       # DISCORD_TOKEN
       # SA_CHANNEL_ID
-      # GEMINI_API_KEY (optional, for screenshots)
+      # SUPABASE_URL
+      # SUPABASE_SERVICE_ROLE_KEY
+      # GEMINI_API_KEY (optional, screenshots)
       # SA_OPERATOR_ROLE_IDS (optional)
