@@ -65,12 +65,15 @@ async def main() -> int:
             continue
         print(f"Seeding {path.name} ({snap.get('event_id')})…")
         if snap.get("active"):
-            n = await sync_all_scores(snap)
+            n, detail = await sync_all_scores(snap)
+            print(f"  → {detail}")
+            if n is not None and "event failed" not in detail:
+                ok += 1
         else:
-            await close_event(snap)
-            n = 1
-        if n is not None:
-            ok += 1
+            closed_ok, detail = await close_event(snap)
+            print(f"  → {detail}")
+            if closed_ok:
+                ok += 1
         await asyncio.sleep(0.2)
 
     print(f"Done. Processed {ok} file(s).")

@@ -55,7 +55,7 @@ from supabase_sync import (
 load_dotenv()
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-27-supabase-fake-push-v2"
+BOT_VERSION = "2026-07-27-website-honest-sync-v3"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -189,6 +189,61 @@ def save_state(state: dict) -> None:
 
 def new_event_id() -> str:
     return datetime.now(timezone.utc).strftime("sa-%Y%m%d-%H%M%S")
+
+
+def ensure_live_identity(state: dict, *, save: bool = True) -> tuple[dict, bool]:
+    """
+    Live events MUST have event_id + started_at or the website never sees them.
+    Heals zombie state (active=true, event_id=null) that previously broke the site.
+    Returns (state, healed).
+    """
+    if not state.get("active"):
+        return state, False
+    healed = False
+    if not state.get("event_id"):
+        state["event_id"] = new_event_id()
+        healed = True
+        print(f"HEAL: minted missing event_id → {state['event_id']}")
+    if not state.get("started_at"):
+        state["started_at"] = int(time.time())
+        healed = True
+        print(f"HEAL: set missing started_at → {state['started_at']}")
+    if healed and save:
+        save_state(state)
+    return state, healed
+
+
+async def publish_event_to_website(state: dict) -> tuple[bool, str]:
+    """Push event shell; always returns (ok, human detail) for Discord replies."""
+    state, _ = ensure_live_identity(state, save=True)
+    if not supabase_enabled():
+        return False, "website sync OFF (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)"
+    try:
+        ok, detail = await supabase_upsert_event(state)
+        return ok, detail
+    except Exception as e:
+        return False, str(e)
+
+
+async def publish_scores_to_website(state: dict) -> tuple[bool, str]:
+    """Push event + all scores. Honest status for operators."""
+    state, _ = ensure_live_identity(state, save=True)
+    if not supabase_enabled():
+        return False, "website sync OFF (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)"
+    try:
+        count, detail = await supabase_sync_all_scores(state)
+        # count can be 0 with a healthy empty board — still OK if event upserted
+        if detail.startswith("event failed") or detail == "no event_id" or "env missing" in detail:
+            return False, detail
+        return True, detail
+    except Exception as e:
+        return False, str(e)
+
+
+def website_status_line(ok: bool, detail: str) -> str:
+    if ok:
+        return f"🌐 **Website:** LIVE push OK (`{detail}`)"
+    return f"🌐 **Website:** ❌ FAILED — `{detail}`\n_Discord board still works. Fix env/sync before bank events._"
 
 
 # ---------------------------------------------------------------------------
@@ -1493,13 +1548,15 @@ async def begin_live_event(
         await update_board(state, force_new=not preserve_board)
 
     # Push event shell to Supabase so the website shows LIVE immediately
-    try:
-        await supabase_upsert_event(load_state())
-    except Exception as e:
-        print(f"Supabase upsert_event (start) failed: {e}")
-
+    state = load_state()
+    state, _ = ensure_live_identity(state, save=True)
+    web_ok, web_detail = await publish_event_to_website(state)
     state = load_state()
     state["_thread_id"] = thread.id if thread else None
+    state["_website_ok"] = web_ok
+    state["_website_detail"] = web_detail
+    if not web_ok:
+        print(f"Supabase upsert_event (start) FAILED: {web_detail}")
     return state
 
 
@@ -1520,9 +1577,11 @@ async def finish_live_event(*, auto: bool = False) -> dict:
     await close_submit_thread(state)
 
     # Final leaderboard snapshot → Supabase (Vercel site)
+    web_ok, web_detail = False, "not attempted"
     try:
-        await supabase_close_event(load_state())
+        web_ok, web_detail = await supabase_close_event(load_state())
     except Exception as e:
+        web_detail = str(e)
         print(f"Supabase close_event failed: {e}")
 
     lines = [
@@ -1530,6 +1589,7 @@ async def finish_live_event(*, auto: bool = False) -> dict:
         + (" _(timer)_" if auto else ""),
         f"Song: {song_line(state)}",
         f"Difficulty: {difficulty_line(state)}",
+        website_status_line(web_ok, web_detail),
     ]
     for mode in MODES:
         rows = ranked_mode_scores(state, mode, limit=3)
@@ -1846,10 +1906,9 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
                 f"duration={duration} song={title!r} diff={event_diff!r}"
             )
             await post_scheduled_notice(state)
-            try:
-                await supabase_upsert_event(state)
-            except Exception as e:
-                print(f"Supabase upsert_event (schedule) failed: {e}")
+            web_ok, web_detail = await publish_event_to_website(state)
+            if not web_ok:
+                print(f"Supabase upsert_event (schedule) FAILED: {web_detail}")
 
             reply = (
                 f"📅 **Put-up scheduled** in {format_duration(start_in)}\n"
@@ -1857,7 +1916,8 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
                 f"Difficulty: {difficulty_line(state)}\n"
                 f"Goes live: <t:{go_live_at}:F> · <t:{go_live_at}:R>\n"
                 f"_A yellow **not open** notice was posted — that is **not** the live event. "
-                f"Scores stay closed until then._"
+                f"Scores stay closed until then._\n"
+                f"{website_status_line(web_ok, web_detail)}"
             )
             if duration:
                 reply += (
@@ -1882,12 +1942,15 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
             else "⚠️ Could not create scores thread — scores accepted in this channel "
             "(grant **Create Public Threads** and restart event)."
         )
+        web_ok = bool(state.get("_website_ok"))
+        web_detail = str(state.get("_website_detail") or "unknown")
         reply = (
             f"Surprise Attack **started** `{state['event_id']}`\n"
             f"Song: {song_line(state)}\n"
             f"Difficulty: {difficulty_line(state)}\n"
             f"{thread_note}\n"
-            "Leaderboard stays in this channel."
+            "Leaderboard stays in this channel.\n"
+            f"{website_status_line(web_ok, web_detail)}"
         )
         if state.get("scheduled_end_at"):
             reply += (
@@ -2176,9 +2239,11 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
         }
         result = record_score(state, fake, discord_user_id=message.author.id)
         state = load_state()
+        state, _ = ensure_live_identity(state, save=True)
         await update_board(state)
 
         # Push to website (Supabase) — same path as real score intake
+        web_ok, web_detail = False, "no improvement (not pushed)"
         if result.get("improved"):
             try:
                 eid = state.get("event_id")
@@ -2187,23 +2252,31 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
                     result.get("player_hash"),
                 )
                 row = ((state.get("scores") or {}).get(mode) or {}).get(pkey)
-                if eid and row:
-                    await supabase_upsert_event(state)
-                    ok = await supabase_upsert_score(eid, mode, pkey, row)
-                    if not ok:
-                        print(
-                            f"Supabase fake score push failed event={eid} "
-                            f"mode={mode} player={pkey}"
+                if not eid:
+                    web_ok, web_detail = False, "no event_id after heal (impossible?)"
+                elif not row:
+                    web_ok, web_detail = False, "score row missing after record"
+                else:
+                    e_ok, e_detail = await supabase_upsert_event(state)
+                    if not e_ok:
+                        web_ok, web_detail = False, e_detail
+                    else:
+                        s_ok, s_detail = await supabase_upsert_score(
+                            eid, mode, pkey, row
+                        )
+                        web_ok, web_detail = s_ok, (
+                            f"score ok ({e_detail})" if s_ok else s_detail
                         )
             except Exception as e:
+                web_ok, web_detail = False, str(e)
                 print(f"Supabase fake score push error: {e}")
 
         if result.get("improved"):
             await message.reply(
                 f"Test score logged → **{game_mode_label(mode)}** · "
                 f"**{player}** · `{score:,}`\n"
-                "Check the live leaderboard message above"
-                + (" + website." if supabase_enabled() else "."),
+                "Check the live leaderboard message above.\n"
+                f"{website_status_line(web_ok, web_detail)}",
                 mention_author=False,
             )
         else:
@@ -2356,6 +2429,7 @@ async def process_score_message(
     if result.get("improved"):
         try:
             st = load_state()
+            st, _ = ensure_live_identity(st, save=True)
             eid = st.get("event_id")
             mode = result.get("mode") or "classic"
             pkey = player_storage_key(
@@ -2364,7 +2438,17 @@ async def process_score_message(
             )
             row = ((st.get("scores") or {}).get(mode) or {}).get(pkey)
             if eid and row:
-                await supabase_upsert_score(eid, mode, pkey, row)
+                e_ok, e_detail = await supabase_upsert_event(st)
+                if not e_ok:
+                    print(f"Supabase upsert_event (score path) FAILED: {e_detail}")
+                else:
+                    s_ok, s_detail = await supabase_upsert_score(eid, mode, pkey, row)
+                    if not s_ok:
+                        print(f"Supabase upsert_score FAILED: {s_detail}")
+            else:
+                print(
+                    f"Supabase skip score: eid={eid!r} row_present={bool(row)}"
+                )
         except Exception as e:
             print(f"Supabase upsert_score failed: {e}")
 
@@ -2516,19 +2600,31 @@ async def on_ready():
 
     state = load_state()
     if state.get("active"):
-        print(f"Resuming live event {state.get('event_id')}")
+        state, healed = ensure_live_identity(state, save=True)
+        print(
+            f"Resuming live event {state.get('event_id')}"
+            + (" (healed missing id/start)" if healed else "")
+        )
         if state.get("scheduled_end_at"):
             print(f"  take-down scheduled at unix {state['scheduled_end_at']}")
         asyncio.create_task(update_board(state))
         if supabase_enabled():
-            asyncio.create_task(supabase_sync_all_scores(state))
+            async def _boot_sync() -> None:
+                ok, detail = await publish_scores_to_website(state)
+                print(f"Boot website sync: ok={ok} {detail}")
+
+            asyncio.create_task(_boot_sync())
     elif state.get("scheduled_start_at"):
         print(
             f"Pending put-up at unix {state['scheduled_start_at']} "
             f"song={state.get('song_title')!r}"
         )
         if supabase_enabled() and state.get("event_id"):
-            asyncio.create_task(supabase_upsert_event(state))
+            async def _boot_sched() -> None:
+                ok, detail = await publish_event_to_website(state)
+                print(f"Boot schedule publish: ok={ok} {detail}")
+
+            asyncio.create_task(_boot_sched())
 
     # Background put-up / take-down timers (survives redeploys via sa_state.json)
     global _scheduler_started

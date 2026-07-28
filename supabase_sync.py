@@ -1,7 +1,7 @@
 """
 Push Surprise Attack events + scores to Supabase for the Vercel leaderboard.
 
-Env (Render dashboard):
+Env (Render dashboard / local .env):
   SUPABASE_URL                  https://xxxx.supabase.co
   SUPABASE_SERVICE_ROLE_KEY     service_role secret (never put in the website)
 
@@ -9,6 +9,7 @@ Optional aliases:
   SA_SUPABASE_URL / SA_SUPABASE_SERVICE_KEY
 
 If URL/key are missing, all functions no-op (bot still works offline).
+Returns (ok, detail) so Discord can scream when the website path fails.
 """
 
 from __future__ import annotations
@@ -114,9 +115,9 @@ async def _request(
     *,
     json_body: Any = None,
     params: dict[str, str] | None = None,
-) -> bool:
+) -> tuple[bool, str]:
     if not supabase_enabled():
-        return False
+        return False, "Supabase env missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)"
     url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
     try:
         timeout = aiohttp.ClientTimeout(total=20)
@@ -128,24 +129,26 @@ async def _request(
                 json=json_body,
                 params=params,
             ) as resp:
+                text = await resp.text()
                 if resp.status >= 400:
-                    text = await resp.text()
-                    print(f"Supabase {method} {path} → {resp.status}: {text[:300]}")
-                    return False
-                return True
+                    detail = f"HTTP {resp.status}: {text[:400]}"
+                    print(f"Supabase {method} {path} → {detail}")
+                    return False, detail
+                return True, "ok"
     except Exception as e:
-        print(f"Supabase request failed ({method} {path}): {e}")
-        return False
+        detail = f"request failed: {e}"
+        print(f"Supabase {method} {path} → {detail}")
+        return False, detail
 
 
-async def upsert_event(state: dict) -> bool:
+async def upsert_event(state: dict) -> tuple[bool, str]:
     if not supabase_enabled():
-        return False
+        return False, "Supabase env missing (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)"
     event_id = state.get("event_id")
     if not event_id:
-        return False
+        return False, "no event_id on state (cannot publish to website)"
     row = event_row_from_state(state)
-    ok = await _request(
+    ok, detail = await _request(
         "POST",
         "sa_events",
         json_body=row,
@@ -153,7 +156,8 @@ async def upsert_event(state: dict) -> bool:
     )
     if ok:
         print(f"Supabase: event upserted {event_id} status={row['status']}")
-    return ok
+        return True, f"event {event_id} status={row['status']}"
+    return False, detail
 
 
 async def upsert_score(
@@ -161,13 +165,13 @@ async def upsert_score(
     mode: str,
     player_key: str,
     row: dict,
-) -> bool:
+) -> tuple[bool, str]:
     if not supabase_enabled():
-        return False
+        return False, "Supabase env missing"
     if mode not in MODES or not event_id or not player_key:
-        return False
+        return False, f"bad score args mode={mode!r} event_id={event_id!r}"
     body = score_row(event_id, mode, player_key, row)
-    ok = await _request(
+    ok, detail = await _request(
         "POST",
         "sa_scores",
         json_body=body,
@@ -178,18 +182,22 @@ async def upsert_score(
             f"Supabase: score {mode} {body['player_name']}={body['score']} "
             f"event={event_id}"
         )
-    return ok
+        return True, "ok"
+    return False, detail
 
 
-async def sync_all_scores(state: dict) -> int:
-    """Upsert every score in state. Returns count of successful mode rows."""
+async def sync_all_scores(state: dict) -> tuple[int, str]:
+    """Upsert event + every score. Returns (count, detail)."""
     if not supabase_enabled():
-        return 0
+        return 0, "Supabase env missing"
     event_id = state.get("event_id")
     if not event_id:
-        return 0
-    await upsert_event(state)
+        return 0, "no event_id"
+    ok, detail = await upsert_event(state)
+    if not ok:
+        return 0, f"event failed: {detail}"
     count = 0
+    errors: list[str] = []
     scores = state.get("scores") or {}
     for mode in MODES:
         bucket = scores.get(mode) or {}
@@ -198,24 +206,32 @@ async def sync_all_scores(state: dict) -> int:
         for player_key, row in bucket.items():
             if not isinstance(row, dict):
                 continue
-            if await upsert_score(event_id, mode, player_key, row):
+            sok, sdetail = await upsert_score(event_id, mode, player_key, row)
+            if sok:
                 count += 1
-            # light pacing
+            else:
+                errors.append(f"{mode}/{player_key}: {sdetail}")
             await _sleep(0.05)
-    print(f"Supabase: synced {count} score row(s) for {event_id}")
-    return count
+    msg = f"synced {count} score row(s) for {event_id}"
+    if errors:
+        msg += f"; {len(errors)} error(s): {errors[0]}"
+    print(f"Supabase: {msg}")
+    return count, msg
 
 
-async def close_event(state: dict) -> bool:
+async def close_event(state: dict) -> tuple[bool, str]:
     """Mark event closed and push final scores."""
     if not supabase_enabled():
-        return False
+        return False, "Supabase env missing"
     state = dict(state)
     state["active"] = False
     if not state.get("ended_at"):
         state["ended_at"] = int(time.time())
-    await sync_all_scores(state)
-    return True
+    count, detail = await sync_all_scores(state)
+    if count >= 0 and "event failed" not in detail and "env missing" not in detail:
+        # sync_all_scores already upserted closed status via active=False
+        return True, detail
+    return False, detail
 
 
 async def _sleep(seconds: float) -> None:
