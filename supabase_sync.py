@@ -24,21 +24,36 @@ import aiohttp
 MODES = ("arcade", "classic", "fusion")
 
 
+def _clean_env(value: str | None) -> str:
+    """Strip whitespace and accidental surrounding quotes from dashboard pastes."""
+    if not value:
+        return ""
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return v
+
+
 def _supabase_url() -> str:
     """Read at call time so load_dotenv() / Render env always win."""
-    return (
+    raw = (
         os.getenv("SUPABASE_URL")
         or os.getenv("SA_SUPABASE_URL")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
         or ""
-    ).strip().rstrip("/")
+    )
+    return _clean_env(raw).rstrip("/")
 
 
 def _supabase_service_key() -> str:
-    return (
+    raw = (
         os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         or os.getenv("SA_SUPABASE_SERVICE_KEY")
+        or os.getenv("SUPABASE_SERVICE_KEY")
+        or os.getenv("SUPABASE_KEY")  # last-resort alias (must be service_role, not anon)
         or ""
-    ).strip()
+    )
+    return _clean_env(raw)
 
 
 def supabase_enabled() -> bool:

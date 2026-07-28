@@ -57,7 +57,7 @@ from supabase_sync import (  # noqa: E402
 )
 
 # Bump this on every deploy-critical fix so !sa help proves which build is live.
-BOT_VERSION = "2026-07-27-website-status-v5"
+BOT_VERSION = "2026-07-28-website-force-v6"
 
 BOT_DIR = Path(__file__).resolve().parent
 
@@ -2094,8 +2094,21 @@ async def handle_sa_command(message: discord.Message, cmd: dict) -> None:
 
     if action in ("board", "lb", "refresh"):
         ok = await update_board(state, force_new=False)
+        web_line = ""
+        if state.get("active") or state.get("scheduled_start_at"):
+            if state.get("active"):
+                state, _ = ensure_live_identity(state, save=True)
+                w_ok, w_detail = await publish_scores_to_website(state)
+            else:
+                w_ok, w_detail = await publish_event_to_website(state)
+            web_line = "\n" + website_status_line(w_ok, w_detail)
         await message.reply(
-            "Leaderboard refreshed." if ok else "Could not update the board — check bot permissions.",
+            (
+                "Leaderboard refreshed."
+                if ok
+                else "Could not update the board — check bot permissions."
+            )
+            + web_line,
             mention_author=False,
         )
         return
@@ -2718,8 +2731,14 @@ async def on_message(message: discord.Message):
 # ---------------------------------------------------------------------------
 
 async def health_check(_request: web.Request) -> web.Response:
-    """Render health probe — free-tier web services need a listening $PORT."""
-    return web.Response(text="ok")
+    """
+    Render health probe — free-tier web services need a listening $PORT.
+    Body includes build + supabase so we can prove which process is live
+    without Render dashboard access: GET /health
+    """
+    detail = supabase_config_detail()
+    # Keep it one line; Render only needs HTTP 200.
+    return web.Response(text=f"ok {BOT_VERSION} supabase={detail}")
 
 
 async def start_health_server() -> web.AppRunner | None:
@@ -2736,6 +2755,7 @@ async def start_health_server() -> web.AppRunner | None:
     site = web.TCPSite(runner, "0.0.0.0", int(port_raw))
     await site.start()
     print(f"Health check server listening on 0.0.0.0:{port_raw}")
+    print(f"Health body will report: ok {BOT_VERSION} supabase={supabase_config_detail()}")
     return runner
 
 
